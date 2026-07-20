@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AutoTranslate settings</title>
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body>
+    <main>
+      <h1>AutoTranslate backend settings</h1>
+      <p>The extension connects to one small backend. That backend can issue OpenAI Realtime credentials, run a fully local Whisper → Ollama → Piper pipeline, or support both.</p>
+
+      <form id="settingsForm">
+        <label for="backendUrl">Backend URL</label>
+        <input id="backendUrl" name="backendUrl" type="url" required placeholder="http://localhost:8787" />
+        <small>For a remote backend, saving may trigger a browser permission prompt for that origin.</small>
+        <button type="submit">Save settings</button>
+      </form>
+
+      <p id="status" role="status"></p>
+
+      <section>
+        <h2>Provider behavior</h2>
+        <p><strong>OpenAI Realtime:</strong> captured tab audio is sent directly from the extension to OpenAI over WebRTC. The backend only creates a short-lived client secret.</p>
+        <p><strong>Ollama local:</strong> captured tab audio is sent only to this backend. The backend converts and transcribes it with whisper.cpp, translates the text with your local Ollama model, and optionally generates a dub with Piper.</p>
+      </section>
+
+      <section>
+        <h2>Privacy</h2>
+        <p>Choose Ollama local when you want the audio, transcript, translation, and optional speech generation to remain on your machine. Ollama cloud models are not local; use a locally installed model and optionally set <code>OLLAMA_NO_CLOUD=1</code> in Ollama for local-only operation.</p>
+      </section>
+    </main>
+    <script type="module" src="options.js"></script>
+  </body>
+</html>

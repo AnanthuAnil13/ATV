@@ -1,0 +1,20 @@
+{
+  "name": "autotranslate-provider-server",
+  "version": "0.4.0",
+  "private": true,
+  "type": "module",
+  "description": "Provider backend for AutoTranslate Video with OpenAI Realtime and local Whisper/Ollama/Piper translation.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "check": "node --check src/server.js && node --check src/languages.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^5.1.0"
+  }
+}

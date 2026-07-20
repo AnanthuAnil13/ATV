@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "AutoTranslate Video: OpenAI + Ollama",
+  "version": "0.4.0",
+  "description": "Live AI-translated subtitles and dubbing for browser videos using OpenAI Realtime or a local Ollama pipeline.",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "activeTab",
+    "offscreen",
+    "scripting",
+    "storage",
+    "tabCapture"
+  ],
+  "host_permissions": [
+    "http://localhost:8787/*",
+    "https://api.openai.com/*"
+  ],
+  "optional_host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "service-worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "AutoTranslate Video",
+    "default_popup": "popup/popup.html"
+  },
+  "options_page": "options/options.html"
+}

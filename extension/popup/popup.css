@@ -1,0 +1,187 @@
+:root {
+  color-scheme: dark;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: #0b111c;
+  color: #f6f8fc;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 430px; background: #0b111c; }
+main { padding: 20px; }
+
+header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+h1 { margin: 0; font-size: 24px; letter-spacing: -0.03em; }
+header p { margin: 3px 0 0; color: #8f9bb0; font-size: 12px; }
+
+#statusBadge {
+  padding: 5px 9px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 999px;
+  color: #b8c3d4;
+  background: rgba(255, 255, 255, 0.06);
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+#statusBadge[data-status="connected"] { color: #a9f2cc; background: rgba(29, 172, 104, 0.16); }
+#statusBadge[data-status="starting"],
+#statusBadge[data-status="reconnecting"] { color: #c6dbff; background: rgba(80, 137, 230, 0.17); }
+#statusBadge[data-status="error"] { color: #ffbdc4; background: rgba(210, 55, 72, 0.18); }
+
+.pair-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 24px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  margin-top: 22px;
+}
+
+label > span,
+.mode-field > span {
+  display: block;
+  margin-bottom: 7px;
+  color: #c4cedc;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+label small { display: block; margin-top: 6px; color: #718097; font-size: 10px; line-height: 1.35; }
+.arrow { padding-top: 22px; color: #5f6d82; text-align: center; }
+.mode-field { display: block; margin-top: 17px; }
+
+select,
+input,
+button { font: inherit; }
+
+select {
+  width: 100%;
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  border-radius: 10px;
+  padding: 10px 11px;
+  color: #f8faff;
+  background: #141d2b;
+  outline: none;
+}
+
+select:focus { border-color: #68a4ff; box-shadow: 0 0 0 3px rgba(104, 164, 255, 0.14); }
+
+.audio-note {
+  display: grid;
+  gap: 3px;
+  margin-top: 14px;
+  padding: 11px 12px;
+  border: 1px solid rgba(104, 164, 255, 0.16);
+  border-radius: 11px;
+  background: rgba(70, 119, 197, 0.10);
+  color: #b9c8dd;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.audio-note strong { color: #eef5ff; font-size: 12px; }
+
+.mix-card {
+  display: grid;
+  gap: 13px;
+  margin-top: 13px;
+  padding: 13px;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.range-row { display: grid; gap: 7px; }
+.range-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.range-heading label { color: #c4cedc; font-size: 11px; font-weight: 700; }
+.range-heading output { color: #8faddc; font-size: 10px; font-variant-numeric: tabular-nums; }
+input[type="range"] { width: 100%; accent-color: #65a1ff; }
+input[type="range"]:disabled { opacity: 0.35; }
+
+.toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-top: 15px;
+  color: #c4cedc;
+  font-size: 12px;
+}
+
+.toggle-row[data-disabled="true"] { opacity: 0.42; }
+.toggle-row span { margin: 0; }
+.toggle-row input { accent-color: #65a1ff; }
+
+#message {
+  min-height: 34px;
+  margin: 15px 0 8px;
+  color: #aeb9ca;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+#message.error { color: #ffb3bc; }
+
+.actions {
+  display: grid;
+  grid-template-columns: 1fr 92px;
+  gap: 10px;
+}
+
+button {
+  border: 0;
+  border-radius: 10px;
+  padding: 11px 14px;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+.primary { background: #6aa4ff; color: #07101f; }
+.secondary { background: rgba(255, 255, 255, 0.1); color: #fff; }
+
+footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 17px;
+  color: #78869c;
+  font-size: 10px;
+}
+
+footer button {
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+  color: #9ebcf1;
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.provider-card {
+  display: grid;
+  gap: 12px;
+  margin-top: 20px;
+  padding: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  border-radius: 13px;
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.provider-card label { display: block; }
+.provider-card label + label { margin-top: 2px; }
+.provider-status {
+  min-height: 0;
+  margin: 0;
+  color: #91a1b8;
+  font-size: 10px;
+  line-height: 1.45;
+}
+.provider-status.error { color: #ffb3bc; }

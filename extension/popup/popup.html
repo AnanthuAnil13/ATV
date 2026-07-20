@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AutoTranslate Video</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <h1>AutoTranslate</h1>
+          <p>Local or cloud video translation</p>
+        </div>
+        <span id="statusBadge" data-status="idle">Idle</span>
+      </header>
+
+      <section class="provider-card" aria-label="Translation provider">
+        <label>
+          <span>Translation engine</span>
+          <select id="provider" aria-label="Translation engine">
+            <option value="openai">OpenAI Realtime (cloud)</option>
+            <option value="ollama">Ollama (local)</option>
+          </select>
+        </label>
+        <label id="ollamaModelRow" hidden>
+          <span>Ollama model</span>
+          <select id="ollamaModel" aria-label="Ollama model"></select>
+          <small id="ollamaModelHelp">Models are loaded from your local Ollama installation through the backend.</small>
+        </label>
+        <p id="providerStatus" class="provider-status" role="status"></p>
+      </section>
+
+      <section class="pair-grid" aria-label="Language pair">
+        <label>
+          <span>Video language</span>
+          <select id="sourceLanguage" aria-label="Video language"></select>
+          <small id="sourceLanguageHelp">Expected source language.</small>
+        </label>
+        <div class="arrow" aria-hidden="true">→</div>
+        <label>
+          <span>Translation language</span>
+          <select id="targetLanguage" aria-label="Translation language"></select>
+        </label>
+      </section>
+
+      <label class="mode-field">
+        <span>Output mode</span>
+        <select id="outputMode" aria-label="Output mode">
+          <option value="both">Subtitles + dub</option>
+          <option value="subtitles">Subtitles only</option>
+          <option value="dub">Dub only</option>
+        </select>
+      </label>
+
+      <aside id="modeNote" class="audio-note" aria-live="polite"></aside>
+
+      <section class="mix-card" aria-label="Audio mix">
+        <div class="range-row">
+          <div class="range-heading">
+            <label for="originalVolume">Original audio</label>
+            <output id="originalVolumeValue" for="originalVolume">15%</output>
+          </div>
+          <input id="originalVolume" type="range" min="0" max="100" step="1" value="15" />
+        </div>
+        <div class="range-row">
+          <div class="range-heading">
+            <label for="dubVolume">Translated dub</label>
+            <output id="dubVolumeValue" for="dubVolume">100%</output>
+          </div>
+          <input id="dubVolume" type="range" min="0" max="100" step="1" value="100" />
+        </div>
+      </section>
+
+      <label id="sourceTranscriptRow" class="toggle-row">
+        <input id="showSourceTranscript" type="checkbox" />
+        <span>Also show the source-language transcript</span>
+      </label>
+
+      <p id="message" role="status"></p>
+
+      <div class="actions">
+        <button id="startButton" class="primary" type="button">Start subtitles + dub</button>
+        <button id="stopButton" class="secondary" type="button" disabled>Stop</button>
+      </div>
+
+      <footer>
+        <span id="privacyLabel">AI-generated live translation</span>
+        <button id="openOptions" type="button">Backend settings</button>
+      </footer>
+    </main>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>
