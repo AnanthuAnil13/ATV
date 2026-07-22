@@ -633,6 +633,11 @@ async function processLocalQueue(currentSession) {
         }
       }
       if (isDubEnabled(currentSession.config.outputMode)) {
+        if (shouldUseBufferedTimedDubClips(currentSession.config)) {
+          notePreparedTimedDubClips(result, item);
+          continue;
+        }
+
         const dubClips = Array.isArray(result.dubClips) ? result.dubClips : [];
         if (dubClips.length) {
           for (const clip of dubClips) {
@@ -877,6 +882,7 @@ async function stopSession({ notify }) {
     }
   } catch {}
   try { await oldSession.audioContext?.close(); } catch {}
+  await endLocalBackendSession(oldSession.config).catch(() => null);
 
   if (notify) {
     notifyStatus("idle", {
@@ -890,6 +896,16 @@ function notifyStatus(status, extra) {
   chrome.runtime.sendMessage({
     type: "OFFSCREEN_STATUS",
     payload: { status, ...extra }
+  }).catch(() => null);
+}
+
+async function endLocalBackendSession(config) {
+  if (config?.provider !== "ollama" || !config.backendUrl || !config.localSessionId) return;
+  await fetch(`${config.backendUrl}/local/session/end`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sessionId: config.localSessionId }),
+    keepalive: true
   }).catch(() => null);
 }
 
@@ -911,6 +927,24 @@ function shouldUseBufferedSubtitleSegments(config) {
   return config?.provider === "ollama" &&
     config?.syncMode === "buffered" &&
     (config?.outputMode === "subtitles" || config?.outputMode === "both");
+}
+
+function shouldUseBufferedTimedDubClips(config) {
+  return config?.provider === "ollama" &&
+    config?.syncMode === "buffered" &&
+    (config?.outputMode === "dub" || config?.outputMode === "both");
+}
+
+function notePreparedTimedDubClips(result, item) {
+  const clips = Array.isArray(result?.timedDubClips) ? result.timedDubClips : [];
+  if (!clips.length) return;
+  console.debug("[AutoTranslate offscreen] timed dub clips prepared", {
+    generation: item.metadata.generation,
+    sequence: item.metadata.sequence,
+    clipCount: clips.length,
+    firstStartMs: finiteDebugNumber(clips[0]?.startMs),
+    lastEndMs: finiteDebugNumber(clips.at(-1)?.endMs)
+  });
 }
 
 function normalizeBufferedSubtitleSegments(result, item, currentSession) {
@@ -990,6 +1024,11 @@ function validateConfig(config) {
 
 function isDubEnabled(outputMode) {
   return outputMode === "dub" || outputMode === "both";
+}
+
+function finiteDebugNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : undefined;
 }
 
 function clampVolume(value) {

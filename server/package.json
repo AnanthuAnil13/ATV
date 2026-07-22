@@ -10,7 +10,7 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
-    "check": "node --check src/server.js && node --check src/languages.js && node --check src/mediaValidation.js && node --check src/whisperSegments.js && node --check src/translatedSegments.js",
+    "check": "node --check src/server.js && node --check src/languages.js && node --check src/mediaValidation.js && node --check src/whisperSegments.js && node --check src/translatedSegments.js && node --check src/timedDubSegments.js",
     "test": "node --test test/*.test.js"
   },
   "dependencies": {

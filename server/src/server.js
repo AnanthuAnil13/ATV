@@ -38,6 +38,21 @@ import {
   shouldTranslateSubtitleSegments,
   stripSourceTextFromSegments
 } from "./translatedSegments.js";
+import {
+  OLLAMA_DUB_SPEAKER_ALIGNMENT_INVALID,
+  OLLAMA_DUB_SPEAKER_ID_INVALID,
+  OLLAMA_DUB_SPEAKER_JSON_INVALID,
+  PIPER_WAV_DURATION_INVALID,
+  PIPER_WAV_INVALID,
+  TIMED_DUB_TIMING_UNAVAILABLE,
+  buildTimedDubClipResponse,
+  buildTimedDubSpeakerOllamaPayload,
+  buildTimedDubSynthesisPlan,
+  determineTimedDubMode,
+  mergeTimedDubSegments,
+  parseWavDurationMs,
+  resolveTimedDubSpeakersWithRetry
+} from "./timedDubSegments.js";
 
 dotenv.config();
 
@@ -136,6 +151,12 @@ app.get("/ollama/models", async (req, res) => {
   } catch (error) {
     res.status(503).json({ error: friendlyOllamaError(error), models: [] });
   }
+});
+
+app.post("/local/session/end", (req, res) => {
+  const sessionId = sanitizeOptionalSessionId(req.body?.sessionId);
+  if (sessionId) localContexts.delete(sessionId);
+  res.json({ ok: true });
 });
 
 app.post("/session", async (req, res) => {
@@ -243,6 +264,11 @@ app.post(
 
       const wantsSubtitles = shouldTranslateSubtitleSegments(outputMode);
       const wantsDub = shouldTranslateDub(outputMode);
+      const wantsTimedDub = determineTimedDubMode({
+        syncMode: chunkMetadata.syncMode,
+        outputMode
+      });
+      const wantsSegmentTranslation = wantsSubtitles || wantsTimedDub;
       if (wantsDub && !getPiperVoiceBank(targetLanguage).length) {
         return res.status(400).json({
           error: `No Piper voice is configured for ${LANGUAGE_LABELS.get(targetLanguage) || targetLanguage}. Use subtitles-only mode or add that language to PIPER_VOICES_JSON or PIPER_VOICE_BANK_JSON.`
@@ -267,11 +293,16 @@ app.post(
         : stripSourceTextFromSegments(transcriptSegmentsWithSource);
       const chunkTiming = buildChunkTimingResponseFields(chunkMetadata);
       if (!sourceText) {
-        return res.json(buildEmptyLocalChunkResponse({ chunkTiming }));
+        return res.json(buildEmptyLocalChunkResponse({
+          chunkTiming,
+          outputMode,
+          syncMode: chunkMetadata.syncMode
+        }));
       }
 
       let translatedSegments = [];
-      if (wantsSubtitles) {
+      let translatedSegmentsWithSourceForDub = [];
+      if (wantsSegmentTranslation) {
         const segmentTranslation = await translateSegmentsWithOllama({
           model: requestedModel,
           sourceLanguage,
@@ -280,14 +311,17 @@ app.post(
           sourceText,
           sessionId
         });
-        translatedSegments = buildTranslatedSegmentResponse({
+        translatedSegmentsWithSourceForDub = buildTranslatedSegmentResponse({
           transcriptSegments: transcriptSegmentsWithSource,
           translatedSegments: segmentTranslation.translatedSegments,
-          showSourceTranscript
+          showSourceTranscript: true
         });
+        translatedSegments = showSourceTranscript
+          ? translatedSegmentsWithSourceForDub
+          : stripSourceTextFromSegments(translatedSegmentsWithSourceForDub);
       }
 
-      const dubTranslation = wantsDub
+      const dubTranslation = wantsDub && !wantsTimedDub
         ? await translateDialogueWithOllama({
             model: requestedModel,
             sourceLanguage,
@@ -300,7 +334,7 @@ app.post(
             turns: []
           };
 
-      if (!wantsSubtitles && !dubTranslation.translatedText) {
+      if (!wantsSubtitles && !wantsTimedDub && !dubTranslation.translatedText) {
         return res.json({
           ok: true,
           empty: true,
@@ -313,7 +347,47 @@ app.post(
       let audioBase64;
       let audioMime;
       const dubClips = [];
-      if (wantsDub && dubTranslation.translatedText) {
+      const timedDubClips = [];
+      if (wantsTimedDub) {
+        const hasTranslatedDubSpeech = translatedSegmentsWithSourceForDub
+          .some((segment) => String(segment.translatedText || "").trim());
+        if (hasTranslatedDubSpeech) {
+          const speakerAssignment = await assignTimedDubSpeakersWithOllama({
+            model: requestedModel,
+            sourceLanguage,
+            targetLanguage,
+            translatedSegments: translatedSegmentsWithSourceForDub,
+            sessionId
+          });
+          const timedDubSegments = mergeTimedDubSegments({
+            translatedSegments: translatedSegmentsWithSourceForDub,
+            speakerAssignments: speakerAssignment.speakerAssignments,
+            generation: chunkMetadata.generation,
+            sequence: chunkMetadata.sequence,
+            requireMappedTiming: true
+          });
+          const synthesisPlan = buildTimedDubSynthesisPlan({
+            timedDubSegments,
+            sessionId,
+            targetLanguage,
+            assignVoice: assignPiperVoice
+          });
+
+          for (const [index, item] of synthesisPlan.entries()) {
+            const outputPath = path.join(tempDir, `timed-dub-${index}.wav`);
+            await synthesizeWithPiper(item.segment.translatedText, targetLanguage, outputPath, item.voice);
+            const audioBuffer = await readFile(outputPath);
+            const audioDurationMs = parseWavDurationMs(audioBuffer);
+            timedDubClips.push(buildTimedDubClipResponse({
+              segment: item.segment,
+              voice: item.voice,
+              audioBuffer,
+              audioMime: "audio/wav",
+              audioDurationMs
+            }));
+          }
+        }
+      } else if (wantsDub && dubTranslation.translatedText) {
         const turns = dubTranslation.turns.length
           ? dubTranslation.turns
           : [{ speakerId: "speaker_1", sourceText, translatedText: dubTranslation.translatedText }];
@@ -343,16 +417,21 @@ app.post(
         translatedSegments,
         dubTranslation,
         dubClips,
+        timedDubClips,
         audioBase64,
         audioMime,
+        syncMode: chunkMetadata.syncMode,
         model: requestedModel
       });
       if (response.translatedText) {
-        updateLocalContext(sessionId, sourceText, response.translatedText, dubTranslation.turns);
+        const contextTurns = wantsTimedDub
+          ? timedDubClips.map((clip) => ({ speakerId: clip.speakerId }))
+          : dubTranslation.turns;
+        updateLocalContext(sessionId, sourceText, response.translatedText, contextTurns);
       }
       return res.json(response);
     } catch (error) {
-      return sendRouteError(res, error, "The local Ollama translation pipeline failed.");
+      return sendRouteError(res, normalizeLocalPipelineError(error), "The local Ollama translation pipeline failed.");
     } finally {
       if (tempDir) await rm(tempDir, { recursive: true, force: true }).catch(() => null);
     }
@@ -630,6 +709,51 @@ async function translateSegmentsWithOllama({ model, sourceLanguage, targetLangua
   }
 }
 
+async function assignTimedDubSpeakersWithOllama({ model, sourceLanguage, targetLanguage, translatedSegments, sessionId }) {
+  const sourceLabel = LANGUAGE_LABELS.get(sourceLanguage) || sourceLanguage;
+  const targetLabel = LANGUAGE_LABELS.get(targetLanguage) || targetLanguage;
+  const context = localContexts.get(sessionId) ?? {};
+  const speakerContext = getKnownSpeakerIds(context, targetLanguage);
+
+  try {
+    return await resolveTimedDubSpeakersWithRetry({
+      translatedSegments,
+      requestSpeakerAssignment: async ({ request, corrective }) => {
+        const payload = buildTimedDubSpeakerOllamaPayload({
+          model,
+          sourceLabel,
+          targetLabel,
+          request,
+          speakerContext,
+          corrective
+        });
+        return fetchOllamaChatContent(payload, "Ollama did not return a text response for timed dub speaker assignment.");
+      }
+    });
+  } catch (error) {
+    if (error.code === OLLAMA_DUB_SPEAKER_JSON_INVALID) {
+      throw createHttpError(
+        502,
+        "Ollama did not return valid JSON for timed dub speaker assignment.",
+        OLLAMA_DUB_SPEAKER_JSON_INVALID,
+        true
+      );
+    }
+    if (
+      error.code === OLLAMA_DUB_SPEAKER_ALIGNMENT_INVALID ||
+      error.code === OLLAMA_DUB_SPEAKER_ID_INVALID
+    ) {
+      throw createHttpError(
+        502,
+        "Ollama timed dub speaker assignments could not be aligned with transcript segments.",
+        error.code,
+        true
+      );
+    }
+    throw error;
+  }
+}
+
 async function fetchOllamaChatContent(payload, emptyMessage = "Ollama did not return a text response.") {
   let response;
   try {
@@ -843,6 +967,11 @@ function sanitizeSessionId(value) {
   const text = typeof value === "string" ? value.trim() : "";
   if (/^[a-zA-Z0-9:_-]{8,200}$/.test(text)) return text;
   return crypto.randomUUID();
+}
+
+function sanitizeOptionalSessionId(value) {
+  const text = typeof value === "string" ? value.trim() : "";
+  return /^[a-zA-Z0-9:_-]{8,200}$/.test(text) ? text : "";
 }
 
 function resolveDefaultOllamaModel(models) {
@@ -1145,6 +1274,39 @@ function createHttpError(statusCode, message, code, expose = false) {
   error.statusCode = statusCode;
   error.code = code;
   error.expose = expose;
+  return error;
+}
+
+function normalizeLocalPipelineError(error) {
+  if (error?.statusCode) return error;
+  if (
+    error?.code === OLLAMA_DUB_SPEAKER_JSON_INVALID ||
+    error?.code === OLLAMA_DUB_SPEAKER_ALIGNMENT_INVALID ||
+    error?.code === OLLAMA_DUB_SPEAKER_ID_INVALID
+  ) {
+    return createHttpError(
+      502,
+      "Ollama timed dub speaker assignments could not be used.",
+      error.code,
+      true
+    );
+  }
+  if (error?.code === PIPER_WAV_INVALID || error?.code === PIPER_WAV_DURATION_INVALID) {
+    return createHttpError(
+      502,
+      "Piper produced invalid WAV audio for a timed dub segment.",
+      error.code,
+      true
+    );
+  }
+  if (error?.code === TIMED_DUB_TIMING_UNAVAILABLE) {
+    return createHttpError(
+      422,
+      "Timed buffered dubbing requires mapped source-video segment timing.",
+      TIMED_DUB_TIMING_UNAVAILABLE,
+      true
+    );
+  }
   return error;
 }
 

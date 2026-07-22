@@ -320,15 +320,15 @@ The extension records the captured tab audio into short WebM/Opus segments and p
 1. converts the segment to 16 kHz mono PCM WAV with ffmpeg
 2. transcribes it with whisper.cpp JSON output
 3. translates the transcript using the selected Ollama model
-4. for dub modes, asks Ollama to split the translation into speaker turns
-5. synthesizes each translated turn with a stable Piper voice assigned to that inferred speaker
-6. returns translated text and optional WAV audio clips to the extension
+4. for Live dub modes, asks Ollama to split the translation into speaker turns
+5. for buffered dub modes, assigns a speaker ID to each timed Whisper segment
+6. synthesizes requested dub audio with stable Piper voices
 
 Local Whisper responses include structured speech segments. The backend normalizes each segment's chunk-relative Whisper timing and, when buffered chunk metadata is available, maps those segment times onto the source video timeline using the captured chunk start/end media times. For local buffered subtitle-capable modes, Ollama returns one translated subtitle item for each Whisper segment ID, and the extension schedules those cues against the delayed player's source-time clock. Pauses and seeks are generation-aware, and severely late cues are dropped instead of being displayed out of sync.
 
-Whole-chunk dubbing and speaker-turn inference remain a separate path from subtitle segment alignment. In **Subtitles + dub** mode, the backend may do separate Ollama work for subtitle-aligned segments and for speaker-aware dub turns so each path can keep its own output contract.
+For local buffered dub-capable modes, the backend now prepares one timed dub clip per non-empty translated Whisper segment. Segment timing comes only from backend-normalized source-video timing, each speaker ID receives a stable Piper voice, and each synthesized WAV duration is measured. Frontend synchronized dub playback is not implemented yet; timed clips are not played by the current immediate dub queue.
 
-Local Live mode and OpenAI mode still use their immediate/streaming subtitle behavior. Local dubbed audio is not synchronized to these subtitle cue timings yet.
+Local Live mode and OpenAI mode still use their immediate/streaming subtitle behavior. Local Live dubbing remains immediate. Audio stretching, fitted dub playback, and lip synchronization are not implemented.
 
 The backend stores only a small in-memory rolling text context for the active local session. Temporary audio and transcript files are deleted after each request.
 

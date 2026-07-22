@@ -328,18 +328,21 @@ export function combineTranslatedSegmentText(translatedSegments) {
     .slice(0, MAX_COMBINED_TRANSLATION_CHARS);
 }
 
-export function buildEmptyLocalChunkResponse({ chunkTiming }) {
-  return {
+export function buildEmptyLocalChunkResponse({ chunkTiming, outputMode, syncMode }) {
+  const wantsTimedDub = syncMode === "buffered" && shouldTranslateDub(outputMode);
+  return removeUndefined({
     ok: true,
     empty: true,
     ...chunkTiming,
     transcriptSegments: [],
-    translatedSegments: []
-  };
+    translatedSegments: [],
+    timedDubClips: wantsTimedDub ? [] : undefined
+  });
 }
 
 export function buildLocalChunkSuccessResponse({
   outputMode,
+  syncMode,
   chunkTiming,
   sourceText,
   showSourceTranscript,
@@ -347,13 +350,15 @@ export function buildLocalChunkSuccessResponse({
   translatedSegments = [],
   dubTranslation = { translatedText: "", turns: [] },
   dubClips = [],
+  timedDubClips = [],
   audioBase64,
   audioMime,
   model
 }) {
   const wantsSubtitles = shouldTranslateSubtitleSegments(outputMode);
   const wantsDub = shouldTranslateDub(outputMode);
-  const translatedText = wantsSubtitles
+  const wantsTimedDub = syncMode === "buffered" && wantsDub;
+  const translatedText = wantsSubtitles || wantsTimedDub
     ? combineTranslatedSegmentText(translatedSegments)
     : cleanTranslationText(dubTranslation?.translatedText);
 
@@ -364,10 +369,11 @@ export function buildLocalChunkSuccessResponse({
     translatedText,
     transcriptSegments,
     translatedSegments: wantsSubtitles ? translatedSegments : undefined,
-    turns: wantsDub ? dubTranslation?.turns ?? [] : [],
-    dubClips: wantsDub ? dubClips : [],
-    audioBase64: wantsDub ? audioBase64 : undefined,
-    audioMime: wantsDub ? audioMime : undefined,
+    turns: wantsDub && !wantsTimedDub ? dubTranslation?.turns ?? [] : [],
+    dubClips: wantsDub && !wantsTimedDub ? dubClips : [],
+    timedDubClips: wantsTimedDub ? timedDubClips : undefined,
+    audioBase64: wantsDub && !wantsTimedDub ? audioBase64 : undefined,
+    audioMime: wantsDub && !wantsTimedDub ? audioMime : undefined,
     model
   });
 }
