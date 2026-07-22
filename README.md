@@ -78,7 +78,8 @@ Required for local subtitles:
 Required only for local dubbing:
 
 - [Piper](https://github.com/OHF-Voice/piper1-gpl)
-- one Piper voice for every target language you want to dub
+- at least one Piper voice for every target language you want to dub
+- multiple Piper voices per target language if you want different inferred characters to sound different
 
 ## Setup
 
@@ -155,6 +156,20 @@ PIPER_COMMAND_ARGS=-m piper
 PIPER_VOICES_JSON={"en":"en_US-lessac-medium"}
 ```
 
+For character-style voice variety in **Subtitles + dub** mode, configure a voice bank with multiple voices for the target language:
+
+```dotenv
+PIPER_VOICE_BANK_JSON={"en":["en_US-lessac-medium","en_US-amy-medium","en_US-ryan-medium"]}
+```
+
+The backend asks the selected Ollama model to split each translated chunk into dialogue turns with stable speaker IDs, then assigns each speaker ID to a configured Piper voice for the session. If only `PIPER_VOICES_JSON` is configured, all inferred speakers use that single voice.
+
+For multi-speaker Piper models or custom voice paths, use object entries:
+
+```dotenv
+PIPER_VOICE_BANK_JSON={"en":[{"id":"voice_a","model":"/voices/en.onnx","args":["--speaker","0"]},{"id":"voice_b","model":"/voices/en.onnx","args":["--speaker","1"]}]}
+```
+
 For multiple output languages:
 
 ```dotenv
@@ -179,6 +194,8 @@ FFMPEG_PATH=ffmpeg
 PIPER_COMMAND=python
 PIPER_COMMAND_ARGS=-m piper
 PIPER_VOICES_JSON={"en":"en_US-lessac-medium"}
+# Optional, for speaker-aware local dubbing:
+PIPER_VOICE_BANK_JSON={"en":["en_US-lessac-medium","en_US-amy-medium","en_US-ryan-medium"]}
 ```
 
 Install and start the backend:
@@ -230,7 +247,7 @@ curl http://localhost:8787/ollama/models
 | Translation engine | `gpt-realtime-translate` | user-selected Ollama model |
 | Speech-to-text | built into realtime service | local whisper.cpp |
 | Subtitles | streaming transcript deltas | translated short chunks |
-| Dubbing | remote WebRTC audio track | local Piper voice |
+| Dubbing | remote WebRTC audio track | local Piper voices |
 | Audio leaves the computer | Yes, directly to OpenAI | No, when backend and Ollama are local |
 | Typical latency | lower | hardware/model dependent and usually higher |
 | API key required | Yes | No |
@@ -288,7 +305,7 @@ Edit `server/src/languages.js`:
 
 - `openAiTarget` should be true only when the current OpenAI Realtime Translation output supports the language.
 - `ollamaTarget` controls whether the language is offered for local text translation. Actual quality depends on the selected Ollama model.
-- To enable local dubbing for that language, add a matching voice in `PIPER_VOICES_JSON`.
+- To enable local dubbing for that language, add a matching voice in `PIPER_VOICES_JSON` or a voice list in `PIPER_VOICE_BANK_JSON`.
 
 Restart the backend. The popup fetches `GET /languages` whenever it opens.
 
@@ -303,8 +320,9 @@ The extension records the captured tab audio into short WebM/Opus segments and p
 1. converts the segment to 16 kHz mono PCM WAV with ffmpeg
 2. transcribes it with whisper.cpp
 3. translates the transcript using the selected Ollama model
-4. optionally synthesizes the translation using the Piper voice mapped to the target language
-5. returns translated text and optional WAV audio to the extension
+4. for dub modes, asks Ollama to split the translation into speaker turns
+5. synthesizes each translated turn with a stable Piper voice assigned to that inferred speaker
+6. returns translated text and optional WAV audio clips to the extension
 
 The backend stores only a small in-memory rolling text context for the active local session. Temporary audio and transcript files are deleted after each request.
 
@@ -329,6 +347,7 @@ For any remote deployment:
 - Ollama mode is chunk-based and normally has noticeably more latency.
 - Local translation quality depends strongly on the Ollama model, quantization, prompt following, and source/target languages.
 - Local transcription quality depends on the whisper.cpp model and audio clarity.
+- Speaker-aware local dubbing is inferred from transcript context. It can keep voices stable for clear dialogue turns, but it is not full visual character recognition or guaranteed speaker diarization.
 - Piper voices are language-specific; text translation can support a language even when local dubbing is unavailable.
 - Loading Piper from the command line for every chunk is simple and portable but slower than a persistent Piper server. A future version can add a persistent TTS adapter.
 - Music, overlapping speakers, fast dialogue, names, and specialized terminology can reduce quality in both providers.

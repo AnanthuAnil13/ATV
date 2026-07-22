@@ -8,6 +8,10 @@ import cors from "cors";
 import dotenv from "dotenv";
 import express from "express";
 import {
+  validateUploadedAudioBody,
+  sanitizeChunkMetadataHeader
+} from "./mediaValidation.js";
+import {
   LANGUAGES,
   LANGUAGE_CODES,
   LANGUAGE_LABELS,
@@ -32,7 +36,9 @@ const ffmpegCommand = process.env.FFMPEG_PATH?.trim() || "ffmpeg";
 const piperCommand = process.env.PIPER_COMMAND?.trim() || "python";
 const piperCommandArgs = splitCommandArgs(process.env.PIPER_COMMAND_ARGS ?? "-m piper");
 const piperVoices = parseStringMap(process.env.PIPER_VOICES_JSON || "{}");
+const piperVoiceBanks = parsePiperVoiceBanks(process.env.PIPER_VOICE_BANK_JSON || "", piperVoices);
 const localCommandTimeoutMs = clampInteger(process.env.LOCAL_COMMAND_TIMEOUT_MS, 15_000, 300_000, 90_000);
+const maxDubTurnsPerChunk = clampInteger(process.env.LOCAL_DUB_MAX_TURNS_PER_CHUNK, 1, 12, 6);
 const rateBuckets = new Map();
 const localContexts = new Map();
 
@@ -55,7 +61,8 @@ app.use(cors({
     "X-AutoTranslate-Show-Source",
     "X-AutoTranslate-Ollama-Model",
     "X-AutoTranslate-Session-Id",
-    "X-AutoTranslate-Installation-Id"
+    "X-AutoTranslate-Installation-Id",
+    "X-AutoTranslate-Chunk-Metadata"
   ]
 }));
 
@@ -91,8 +98,8 @@ app.get("/providers", async (req, res) => {
         label: "Ollama local",
         available: ollama.available,
         supportsSubtitles: ollama.available,
-        supportsDub: ollama.available && Object.keys(piperVoices).length > 0,
-        dubTargets: Object.keys(piperVoices),
+        supportsDub: ollama.available && hasPiperVoiceBanks(),
+        dubTargets: getPiperDubTargets(),
         models: ollama.models,
         defaultModel: resolveDefaultOllamaModel(ollama.models),
         chunkMs: 4500,
@@ -194,13 +201,12 @@ app.post(
       if (!whisperModelPath) {
         return res.status(503).json({ error: "WHISPER_MODEL_PATH is not configured on the backend." });
       }
-      if (!Buffer.isBuffer(req.body) || req.body.length < 128) {
-        return res.status(400).json({ error: "The local pipeline did not receive a usable audio chunk." });
-      }
+      validateUploadedAudioBody(req.body, req.get("content-type"));
       if (!consumeRateLimit(`local:${getClientKey(req)}`, 900)) {
         return res.status(429).json({ error: "Too many local audio-chunk requests." });
       }
 
+      const chunkMetadata = sanitizeChunkMetadataHeader(req.get("X-AutoTranslate-Chunk-Metadata"));
       const sourceLanguage = sanitizeLanguage(req.get("X-AutoTranslate-Source-Language"), "ja");
       const targetLanguage = sanitizeOllamaTargetLanguage(req.get("X-AutoTranslate-Target-Language"), "en");
       const outputMode = sanitizeOutputMode(req.get("X-AutoTranslate-Output-Mode"));
@@ -216,9 +222,9 @@ app.post(
       }
 
       const wantsDub = outputMode === "dub" || outputMode === "both";
-      if (wantsDub && !piperVoices[targetLanguage]) {
+      if (wantsDub && !getPiperVoiceBank(targetLanguage).length) {
         return res.status(400).json({
-          error: `No Piper voice is configured for ${LANGUAGE_LABELS.get(targetLanguage) || targetLanguage}. Use subtitles-only mode or add that language to PIPER_VOICES_JSON.`
+          error: `No Piper voice is configured for ${LANGUAGE_LABELS.get(targetLanguage) || targetLanguage}. Use subtitles-only mode or add that language to PIPER_VOICES_JSON or PIPER_VOICE_BANK_JSON.`
         });
       }
 
@@ -230,35 +236,83 @@ app.post(
       await convertToWhisperWav(inputPath, wavPath);
       const sourceText = await transcribeWithWhisper(wavPath, sourceLanguage, tempDir);
       if (!sourceText) {
-        return res.json({ ok: true, empty: true });
+        return res.json({
+          ok: true,
+          empty: true,
+          sequence: chunkMetadata?.sequence,
+          generation: chunkMetadata?.generation,
+          chunkStartMs: chunkMetadata?.videoStartMs,
+          chunkEndMs: chunkMetadata?.videoEndMs
+        });
       }
 
-      const translatedText = await translateWithOllama({
-        model: requestedModel,
-        sourceLanguage,
-        targetLanguage,
-        sourceText,
-        sessionId
-      });
+      const translation = wantsDub
+        ? await translateDialogueWithOllama({
+            model: requestedModel,
+            sourceLanguage,
+            targetLanguage,
+            sourceText,
+            sessionId
+          })
+        : {
+            translatedText: await translateWithOllama({
+              model: requestedModel,
+              sourceLanguage,
+              targetLanguage,
+              sourceText,
+              sessionId
+            }),
+            turns: []
+          };
+      const translatedText = translation.translatedText;
 
       if (!translatedText) {
-        return res.json({ ok: true, empty: true, sourceText: showSourceTranscript ? sourceText : undefined });
+        return res.json({
+          ok: true,
+          empty: true,
+          sequence: chunkMetadata?.sequence,
+          generation: chunkMetadata?.generation,
+          chunkStartMs: chunkMetadata?.videoStartMs,
+          chunkEndMs: chunkMetadata?.videoEndMs,
+          sourceText: showSourceTranscript ? sourceText : undefined
+        });
       }
 
       let audioBase64;
       let audioMime;
+      const dubClips = [];
       if (wantsDub) {
-        const outputPath = path.join(tempDir, "dub.wav");
-        await synthesizeWithPiper(translatedText, targetLanguage, outputPath);
-        audioBase64 = (await readFile(outputPath)).toString("base64");
-        audioMime = "audio/wav";
+        const turns = translation.turns.length
+          ? translation.turns
+          : [{ speakerId: "speaker_1", sourceText, translatedText }];
+
+        for (const [index, turn] of turns.entries()) {
+          const outputPath = path.join(tempDir, `dub-${index}.wav`);
+          const voice = assignPiperVoice(sessionId, targetLanguage, turn.speakerId);
+          await synthesizeWithPiper(turn.translatedText, targetLanguage, outputPath, voice);
+          dubClips.push({
+            speakerId: turn.speakerId,
+            translatedText: turn.translatedText,
+            audioBase64: (await readFile(outputPath)).toString("base64"),
+            audioMime: "audio/wav"
+          });
+        }
+
+        audioBase64 = dubClips[0]?.audioBase64;
+        audioMime = dubClips[0]?.audioMime;
       }
 
-      updateLocalContext(sessionId, sourceText, translatedText);
+      updateLocalContext(sessionId, sourceText, translatedText, translation.turns);
       return res.json({
         ok: true,
+        sequence: chunkMetadata?.sequence,
+        generation: chunkMetadata?.generation,
+        chunkStartMs: chunkMetadata?.videoStartMs,
+        chunkEndMs: chunkMetadata?.videoEndMs,
         sourceText: showSourceTranscript ? sourceText : undefined,
         translatedText,
+        turns: translation.turns,
+        dubClips,
         audioBase64,
         audioMime,
         model: requestedModel
@@ -320,7 +374,7 @@ async function getOllamaStatus() {
     return {
       available: true,
       models,
-      detail: Object.keys(piperVoices).length
+      detail: hasPiperVoiceBanks()
         ? "Local Whisper transcription, Ollama translation, and Piper dubbing are configured."
         : "Local Whisper transcription and Ollama translation are configured. Add Piper voices to enable local dubbing."
     };
@@ -350,21 +404,30 @@ async function fetchOllamaModels() {
 }
 
 async function convertToWhisperWav(inputPath, wavPath) {
-  await runCommand(ffmpegCommand, [
-    "-y",
-    "-hide_banner",
-    "-loglevel",
-    "error",
-    "-i",
-    inputPath,
-    "-ar",
-    "16000",
-    "-ac",
-    "1",
-    "-c:a",
-    "pcm_s16le",
-    wavPath
-  ]);
+  try {
+    await runCommand(ffmpegCommand, [
+      "-y",
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-i",
+      inputPath,
+      "-ar",
+      "16000",
+      "-ac",
+      "1",
+      "-c:a",
+      "pcm_s16le",
+      wavPath
+    ]);
+  } catch {
+    throw createHttpError(
+      502,
+      "ffmpeg could not decode the uploaded audio chunk. The recording may not be a complete media file.",
+      "FFMPEG_DECODE_FAILED",
+      true
+    );
+  }
 }
 
 async function transcribeWithWhisper(wavPath, sourceLanguage, tempDir) {
@@ -407,31 +470,31 @@ async function translateWithOllama({ model, sourceLanguage, targetLanguage, sour
       headers: { "Content-Type": "application/json" },
       signal: AbortSignal.timeout(localCommandTimeoutMs),
       body: JSON.stringify({
-      model,
-      stream: false,
-      think: false,
-      keep_alive: "10m",
-      format: {
-        type: "object",
-        properties: {
-          translation: { type: "string" }
+        model,
+        stream: false,
+        think: false,
+        keep_alive: "10m",
+        format: {
+          type: "object",
+          properties: {
+            translation: { type: "string" }
+          },
+          required: ["translation"]
         },
-        required: ["translation"]
-      },
-      options: {
-        temperature: 0.15,
-        num_predict: 512
-      },
-      messages: [
-        {
-          role: "system",
-          content: `You are a professional audiovisual translator. Translate spoken ${sourceLabel} dialogue into natural ${targetLabel}. Return only valid JSON with one key named translation. Preserve meaning, tone, names, numbers, and sentence intent. Do not explain, annotate, censor, summarize, or add quotation marks. If the input is only silence, noise, or non-speech, return an empty translation.${contextText}`
+        options: {
+          temperature: 0.15,
+          num_predict: 512
         },
-        {
-          role: "user",
-          content: sourceText
-        }
-      ]
+        messages: [
+          {
+            role: "system",
+            content: `You are a professional audiovisual translator. Translate spoken ${sourceLabel} dialogue into natural ${targetLabel}. Return only valid JSON with one key named translation. Preserve meaning, tone, names, numbers, and sentence intent. Do not explain, annotate, censor, summarize, or add quotation marks. If the input is only silence, noise, or non-speech, return an empty translation.${contextText}`
+          },
+          {
+            role: "user",
+            content: sourceText
+          }
+        ]
       })
     });
   } catch (error) {
@@ -449,20 +512,111 @@ async function translateWithOllama({ model, sourceLanguage, targetLanguage, sour
   }
 
   try {
-    const parsed = JSON.parse(content);
+    const parsed = parseJsonObjectFromText(content);
+    if (!parsed) throw new Error("No JSON object found.");
     return cleanTranslation(parsed.translation);
   } catch {
     return cleanTranslation(content.replace(/^```(?:json)?\s*|\s*```$/g, ""));
   }
 }
 
-async function synthesizeWithPiper(text, targetLanguage, outputPath) {
-  const voice = piperVoices[targetLanguage];
+async function translateDialogueWithOllama({ model, sourceLanguage, targetLanguage, sourceText, sessionId }) {
+  const sourceLabel = LANGUAGE_LABELS.get(sourceLanguage) || sourceLanguage;
+  const targetLabel = LANGUAGE_LABELS.get(targetLanguage) || targetLanguage;
+  const context = localContexts.get(sessionId) ?? {};
+  const recentPairs = context.pairs ?? [];
+  const contextText = recentPairs.length
+    ? `\nRecent context (use only for continuity):\n${recentPairs.map((pair) => `SOURCE: ${pair.source}\nTRANSLATION: ${pair.target}`).join("\n")}`
+    : "";
+  const knownSpeakers = getKnownSpeakerIds(context, targetLanguage);
+  const speakerText = knownSpeakers.length
+    ? `\nKnown speaker IDs in this session: ${knownSpeakers.join(", ")}. Reuse them when the current dialogue likely belongs to the same character.`
+    : "";
+
+  let response;
+  try {
+    response = await fetch(`${ollamaUrl}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: AbortSignal.timeout(localCommandTimeoutMs),
+      body: JSON.stringify({
+        model,
+        stream: false,
+        think: false,
+        keep_alive: "10m",
+        format: {
+          type: "object",
+          properties: {
+            turns: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  speakerId: { type: "string" },
+                  source: { type: "string" },
+                  translation: { type: "string" }
+                },
+                required: ["speakerId", "translation"]
+              }
+            },
+            translation: { type: "string" }
+          },
+          required: ["turns"]
+        },
+        options: {
+          temperature: 0.2,
+          num_predict: 900
+        },
+        messages: [
+          {
+            role: "system",
+            content: `You are a professional audiovisual dubbing translator. Translate spoken ${sourceLabel} dialogue into natural ${targetLabel} and split it into character dialogue turns for dubbing. Return only valid JSON with a turns array. Each turn must have speakerId, source, and translation. Use stable IDs like speaker_1 and speaker_2. Create a new speaker ID only when the transcript strongly suggests a different character or speaker turn; otherwise reuse the current or known speaker. Preserve meaning, tone, names, numbers, and intent. Keep each translation speakable and concise. Do not explain, annotate, censor, summarize, or add quotation marks. If the input is silence, noise, music, or non-speech, return an empty turns array.${speakerText}${contextText}`
+          },
+          {
+            role: "user",
+            content: sourceText
+          }
+        ]
+      })
+    });
+  } catch (error) {
+    throw createHttpError(503, friendlyOllamaError(error));
+  }
+
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw createHttpError(response.status, body.error || `Ollama returned HTTP ${response.status}.`);
+  }
+
+  const content = body.message?.content;
+  if (typeof content !== "string") {
+    throw createHttpError(502, "Ollama did not return a text response.");
+  }
+
+  const parsed = parseJsonObjectFromText(content);
+  const turns = normalizeDialogueTurns(parsed?.turns, sourceText);
+  const translatedText = cleanTranslation(
+    parsed?.translation || turns.map((turn) => turn.translatedText).join(" ") || (parsed ? "" : content)
+  );
+
+  return {
+    translatedText,
+    turns: turns.length
+      ? turns
+      : translatedText
+        ? [{ speakerId: "speaker_1", sourceText, translatedText }]
+        : []
+  };
+}
+
+async function synthesizeWithPiper(text, targetLanguage, outputPath, assignedVoice = null) {
+  const voice = assignedVoice || getPiperVoiceBank(targetLanguage)[0];
   if (!voice) throw createHttpError(400, `No Piper voice is configured for ${targetLanguage}.`);
   await runCommand(piperCommand, [
     ...piperCommandArgs,
     "-m",
-    voice,
+    voice.model,
+    ...voice.args,
     "-f",
     outputPath,
     "--",
@@ -580,13 +734,134 @@ function cleanTranslation(value) {
     .slice(0, 4000);
 }
 
-function updateLocalContext(sessionId, source, target) {
-  const pairs = [...(localContexts.get(sessionId)?.pairs ?? []), { source, target }].slice(-4);
-  localContexts.set(sessionId, { pairs, updatedAt: Date.now() });
+function normalizeDialogueTurns(value, sourceFallback) {
+  if (!Array.isArray(value)) return [];
+
+  const turns = [];
+  for (const [index, item] of value.slice(0, maxDubTurnsPerChunk).entries()) {
+    const translatedText = cleanTranslation(item?.translation ?? item?.translatedText ?? item?.text ?? "");
+    if (!translatedText) continue;
+
+    const sourceText = cleanTranscript(item?.source ?? item?.sourceText ?? "");
+    turns.push({
+      speakerId: normalizeSpeakerId(item?.speakerId ?? item?.speaker ?? item?.character, index + 1),
+      sourceText: sourceText || (turns.length === 0 ? sourceFallback : ""),
+      translatedText
+    });
+  }
+
+  return turns;
+}
+
+function normalizeSpeakerId(value, fallbackIndex) {
+  const normalized = String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 48);
+
+  if (!normalized) return `speaker_${fallbackIndex}`;
+  if (/^\d+$/.test(normalized)) return `speaker_${normalized}`;
+  if (/^speaker\d+$/.test(normalized)) return normalized.replace(/^speaker/, "speaker_");
+  return normalized.startsWith("speaker_") ? normalized : `speaker_${normalized}`;
+}
+
+function parseJsonObjectFromText(value) {
+  const text = String(value || "").trim().replace(/^```(?:json)?\s*|\s*```$/g, "");
+  try {
+    return JSON.parse(text);
+  } catch {}
+
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start >= 0 && end > start) {
+    try {
+      return JSON.parse(text.slice(start, end + 1));
+    } catch {}
+  }
+  return null;
+}
+
+function updateLocalContext(sessionId, source, target, turns = []) {
+  const context = getOrCreateLocalContext(sessionId);
+  context.pairs = [...(context.pairs ?? []), { source, target }].slice(-4);
+  context.recentSpeakers = [
+    ...(context.recentSpeakers ?? []),
+    ...turns.map((turn) => turn.speakerId).filter(Boolean)
+  ].slice(-12);
+  context.updatedAt = Date.now();
+  localContexts.set(sessionId, context);
+  pruneLocalContexts();
+}
+
+function getOrCreateLocalContext(sessionId) {
+  const existing = localContexts.get(sessionId);
+  if (existing) {
+    existing.pairs ??= [];
+    existing.speakerVoices ??= {};
+    existing.voiceCursorByLanguage ??= {};
+    existing.recentSpeakers ??= [];
+    return existing;
+  }
+
+  const context = {
+    pairs: [],
+    speakerVoices: {},
+    voiceCursorByLanguage: {},
+    recentSpeakers: [],
+    updatedAt: Date.now()
+  };
+  localContexts.set(sessionId, context);
+  return context;
+}
+
+function pruneLocalContexts() {
   if (localContexts.size > 100) {
     const oldest = [...localContexts.entries()].sort((a, b) => a[1].updatedAt - b[1].updatedAt).slice(0, 20);
     oldest.forEach(([key]) => localContexts.delete(key));
   }
+}
+
+function getKnownSpeakerIds(context, targetLanguage) {
+  const assigned = Object.keys(context.speakerVoices ?? {})
+    .filter((key) => key.startsWith(`${targetLanguage}:`))
+    .map((key) => key.slice(targetLanguage.length + 1));
+  return [...new Set([...(context.recentSpeakers ?? []), ...assigned])].slice(-12);
+}
+
+function assignPiperVoice(sessionId, targetLanguage, speakerId) {
+  const bank = getPiperVoiceBank(targetLanguage);
+  if (!bank.length) throw createHttpError(400, `No Piper voice is configured for ${targetLanguage}.`);
+
+  const context = getOrCreateLocalContext(sessionId);
+  const normalizedSpeakerId = normalizeSpeakerId(speakerId, 1);
+  const speakerKey = `${targetLanguage}:${normalizedSpeakerId}`;
+  const existingVoiceId = context.speakerVoices[speakerKey];
+  const existingVoice = bank.find((voice) => voice.id === existingVoiceId);
+  if (existingVoice) return existingVoice;
+
+  const cursor = context.voiceCursorByLanguage[targetLanguage] ?? 0;
+  const voice = bank[cursor % bank.length];
+  context.voiceCursorByLanguage[targetLanguage] = cursor + 1;
+  context.speakerVoices[speakerKey] = voice.id;
+  context.updatedAt = Date.now();
+  localContexts.set(sessionId, context);
+  pruneLocalContexts();
+  return voice;
+}
+
+function hasPiperVoiceBanks() {
+  return getPiperDubTargets().length > 0;
+}
+
+function getPiperDubTargets() {
+  return Object.entries(piperVoiceBanks)
+    .filter(([, voices]) => Array.isArray(voices) && voices.length > 0)
+    .map(([language]) => language);
+}
+
+function getPiperVoiceBank(targetLanguage) {
+  return Array.isArray(piperVoiceBanks[targetLanguage]) ? piperVoiceBanks[targetLanguage] : [];
 }
 
 function hashSafetyIdentifier(installationId) {
@@ -614,6 +889,78 @@ function parseStringMap(value) {
     console.warn("PIPER_VOICES_JSON is not valid JSON; local dubbing will be unavailable.");
     return {};
   }
+}
+
+function parsePiperVoiceBanks(value, fallbackVoices) {
+  const banks = {};
+  for (const [language, voice] of Object.entries(fallbackVoices)) {
+    const normalized = normalizePiperVoice(voice, 0);
+    if (normalized) banks[language] = [normalized];
+  }
+
+  if (!value.trim()) return banks;
+
+  try {
+    const parsed = JSON.parse(value);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return banks;
+
+    for (const [language, entry] of Object.entries(parsed)) {
+      if (!/^[a-z]{2,3}$/.test(language)) continue;
+      const list = Array.isArray(entry) ? entry : [entry];
+      const voices = dedupePiperVoices(
+        list
+          .map((item, index) => normalizePiperVoice(item, index))
+          .filter(Boolean)
+      );
+      if (voices.length) banks[language] = voices;
+    }
+  } catch {
+    console.warn("PIPER_VOICE_BANK_JSON is not valid JSON; falling back to PIPER_VOICES_JSON.");
+  }
+
+  return banks;
+}
+
+function normalizePiperVoice(value, index) {
+  if (typeof value === "string") {
+    const model = value.trim();
+    return model
+      ? { id: createPiperVoiceId(model, index), model, args: [] }
+      : null;
+  }
+
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const model = String(value.model ?? value.voice ?? value.path ?? "").trim();
+  if (!model) return null;
+
+  const args = Array.isArray(value.args)
+    ? value.args.map((arg) => String(arg)).filter((arg) => arg && !/[\r\n\0]/.test(arg))
+    : splitCommandArgs(String(value.args ?? ""));
+
+  return {
+    id: createPiperVoiceId(value.id || model, index),
+    model,
+    args
+  };
+}
+
+function dedupePiperVoices(voices) {
+  const counts = new Map();
+  return voices.map((voice) => {
+    const count = counts.get(voice.id) ?? 0;
+    counts.set(voice.id, count + 1);
+    return count === 0 ? voice : { ...voice, id: `${voice.id}_${count + 1}` };
+  });
+}
+
+function createPiperVoiceId(value, index) {
+  const basename = path.basename(String(value || ""), path.extname(String(value || "")));
+  const normalized = basename
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 48);
+  return normalized || `voice_${index + 1}`;
 }
 
 function splitCommandArgs(value) {
@@ -658,17 +1005,19 @@ function consumeRateLimit(key, maxRequests) {
   return existing.count <= maxRequests;
 }
 
-function createHttpError(statusCode, message) {
+function createHttpError(statusCode, message, code, expose = false) {
   const error = new Error(message);
   error.statusCode = statusCode;
+  error.code = code;
+  error.expose = expose;
   return error;
 }
 
 function sendRouteError(res, error, fallbackMessage) {
   console.error(error);
   const statusCode = Number.isInteger(error.statusCode) ? error.statusCode : 500;
-  const message = statusCode < 500 ? error.message : fallbackMessage;
-  return res.status(statusCode).json({ error: message });
+  const message = statusCode < 500 || error.expose ? error.message : fallbackMessage;
+  return res.status(statusCode).json({ error: message, code: error.code });
 }
 
 function cleanCommandError(value) {

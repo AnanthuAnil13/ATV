@@ -1,3 +1,11 @@
+import {
+  audioBlobDiagnostics,
+  createChunkMetadata,
+  createFinalizedAudioBlob,
+  pickAudioRecorderMimeType,
+  validateStandaloneAudioBlob
+} from "./local-chunks.js";
+
 let session = null;
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -184,10 +192,7 @@ async function startOpenAiSession(currentSession) {
 }
 
 async function startOllamaLocalSession(currentSession) {
-  const mimeType = pickRecorderMimeType();
-  if (!mimeType) {
-    throw new Error("This browser cannot encode captured tab audio for the local translation pipeline.");
-  }
+  const mimeType = pickAudioRecorderMimeType();
 
   currentSession.local = {
     mimeType,
@@ -197,8 +202,11 @@ async function startOllamaLocalSession(currentSession) {
     queue: [],
     processing: false,
     startedAt: performance.now(),
+    generation: 0,
+    sequence: 0,
     currentAudio: null,
     audioQueue: [],
+    maxAudioQueue: 8,
     audioPlaying: false
   };
 
@@ -216,10 +224,18 @@ function startNextLocalRecording(currentSession) {
   if (currentSession.sourceTrack.readyState !== "live") return;
 
   const chunks = [];
-  const recorder = new MediaRecorder(currentSession.sourceStream, {
-    mimeType: currentSession.local.mimeType,
+  const captureStartEpochMs = Date.now();
+  const videoStartMs = Math.max(0, performance.now() - currentSession.local.startedAt);
+  const sequence = currentSession.local.sequence++;
+  const generation = currentSession.local.generation;
+  const recorderOptions = {
     audioBitsPerSecond: 96_000
-  });
+  };
+  if (currentSession.local.mimeType) {
+    recorderOptions.mimeType = currentSession.local.mimeType;
+  }
+
+  const recorder = new MediaRecorder(currentSession.sourceStream, recorderOptions);
   currentSession.local.recorder = recorder;
 
   recorder.addEventListener("dataavailable", (event) => {
@@ -232,15 +248,26 @@ function startNextLocalRecording(currentSession) {
 
   recorder.addEventListener("stop", () => {
     if (session !== currentSession || !currentSession.local) return;
-    const blob = new Blob(chunks, { type: currentSession.local.mimeType });
+    const captureEndEpochMs = Date.now();
+    const videoEndMs = Math.max(videoStartMs, performance.now() - currentSession.local.startedAt);
+    const blob = createFinalizedAudioBlob(chunks, recorder.mimeType || currentSession.local.mimeType);
+    const metadata = createChunkMetadata({
+      syncMode: currentSession.config.syncMode || "live",
+      sequence,
+      generation,
+      captureStartEpochMs,
+      captureEndEpochMs,
+      videoStartMs,
+      videoEndMs,
+      playbackRate: 1
+    });
 
     // Start capturing the next segment before doing any model work. A small
     // stop/start boundary remains, but model latency does not pause capture.
     startNextLocalRecording(currentSession);
 
-    if (blob.size >= 256) {
-      enqueueLocalChunk(currentSession, blob);
-    }
+    validateAndEnqueueLocalChunk(currentSession, blob, metadata)
+      .catch((error) => failLocalSession(currentSession, error));
   }, { once: true });
 
   recorder.start();
@@ -249,14 +276,30 @@ function startNextLocalRecording(currentSession) {
   }, currentSession.local.chunkMs);
 }
 
-function enqueueLocalChunk(currentSession, blob) {
+async function validateAndEnqueueLocalChunk(currentSession, blob, metadata) {
+  if (!blob.size) return;
+  try {
+    await validateStandaloneAudioBlob(blob);
+    logLocalChunkDiagnostic("recorded_audio_chunk_ready", await audioBlobDiagnostics(blob, metadata));
+    enqueueLocalChunk(currentSession, { blob, metadata });
+  } catch (error) {
+    logLocalChunkDiagnostic("recorded_audio_chunk_rejected", {
+      ...(await audioBlobDiagnostics(blob, metadata)),
+      code: error.code || "INVALID_AUDIO_CHUNK"
+    });
+    throw error;
+  }
+}
+
+function enqueueLocalChunk(currentSession, item) {
   const local = currentSession.local;
   if (!local || session !== currentSession) return;
+  if (item.metadata.generation !== local.generation) return;
 
   // Avoid unbounded latency on slower machines. Keep the newest two waiting
   // segments; if inference falls behind, stale untranslated audio is dropped.
   if (local.queue.length >= 2) local.queue.shift();
-  local.queue.push(blob);
+  local.queue.push(item);
   processLocalQueue(currentSession).catch((error) => failLocalSession(currentSession, error));
 }
 
@@ -267,9 +310,11 @@ async function processLocalQueue(currentSession) {
 
   try {
     while (session === currentSession && local.queue.length) {
-      const blob = local.queue.shift();
-      const result = await requestLocalTranslation(currentSession.config, blob);
+      const item = local.queue.shift();
+      if (item.metadata.generation !== local.generation) continue;
+      const result = await requestLocalTranslation(currentSession.config, item);
       assertCurrentSession(currentSession);
+      if (result.generation !== undefined && result.generation !== item.metadata.generation) continue;
       if (result.empty) continue;
 
       const elapsedMs = Math.round(performance.now() - local.startedAt);
@@ -291,8 +336,27 @@ async function processLocalQueue(currentSession) {
           replace: true
         });
       }
-      if (result.audioBase64 && isDubEnabled(currentSession.config.outputMode)) {
-        enqueueLocalDub(currentSession, result.audioBase64, result.audioMime || "audio/wav");
+      if (isDubEnabled(currentSession.config.outputMode)) {
+        const dubClips = Array.isArray(result.dubClips) ? result.dubClips : [];
+        if (dubClips.length) {
+          for (const clip of dubClips) {
+            if (clip?.audioBase64) {
+              enqueueLocalDub(currentSession, {
+                audioBase64: clip.audioBase64,
+                mimeType: clip.audioMime || "audio/wav",
+                speakerId: clip.speakerId,
+                translatedText: clip.translatedText
+              });
+            }
+          }
+        } else if (result.audioBase64) {
+          enqueueLocalDub(currentSession, {
+            audioBase64: result.audioBase64,
+            mimeType: result.audioMime || "audio/wav",
+            speakerId: "speaker_1",
+            translatedText: result.translatedText
+          });
+        }
       }
     }
   } finally {
@@ -300,34 +364,45 @@ async function processLocalQueue(currentSession) {
   }
 }
 
-async function requestLocalTranslation(config, blob) {
-  const response = await fetch(`${config.backendUrl}/local/chunk`, {
-    method: "POST",
-    headers: {
-      "Content-Type": blob.type || "audio/webm",
-      "X-AutoTranslate-Source-Language": config.sourceLanguage,
-      "X-AutoTranslate-Target-Language": config.targetLanguage,
-      "X-AutoTranslate-Output-Mode": config.outputMode,
-      "X-AutoTranslate-Show-Source": String(config.showSourceTranscript),
-      "X-AutoTranslate-Ollama-Model": config.ollamaModel,
-      "X-AutoTranslate-Session-Id": config.localSessionId,
-      "X-AutoTranslate-Installation-Id": config.installationId || "anonymous"
-    },
-    body: blob
-  });
+async function requestLocalTranslation(config, item) {
+  const { blob, metadata } = item;
+  let response;
+  try {
+    response = await fetch(`${config.backendUrl}/local/chunk`, {
+      method: "POST",
+      signal: createRequestTimeoutSignal(150_000),
+      headers: {
+        "Content-Type": blob.type || "application/octet-stream",
+        "X-AutoTranslate-Source-Language": config.sourceLanguage,
+        "X-AutoTranslate-Target-Language": config.targetLanguage,
+        "X-AutoTranslate-Output-Mode": config.outputMode,
+        "X-AutoTranslate-Show-Source": String(config.showSourceTranscript),
+        "X-AutoTranslate-Ollama-Model": config.ollamaModel,
+        "X-AutoTranslate-Session-Id": config.localSessionId,
+        "X-AutoTranslate-Installation-Id": config.installationId || "anonymous",
+        "X-AutoTranslate-Chunk-Metadata": JSON.stringify(metadata)
+      },
+      body: blob
+    });
+  } catch (error) {
+    if (error.name === "AbortError" || error.name === "TimeoutError") {
+      throw new Error("The local translation backend request timed out.");
+    }
+    throw new Error("Could not reach the local translation backend. Check that it is running and reachable.");
+  }
 
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(data.error || `The local translation backend returned ${response.status}.`);
+    throw createLocalBackendError(response.status, data);
   }
   return data;
 }
 
-function enqueueLocalDub(currentSession, audioBase64, mimeType) {
+function enqueueLocalDub(currentSession, clip) {
   const local = currentSession.local;
   if (!local || session !== currentSession) return;
-  if (local.audioQueue.length >= 2) local.audioQueue.shift();
-  local.audioQueue.push({ audioBase64, mimeType });
+  if (local.audioQueue.length >= local.maxAudioQueue) local.audioQueue.shift();
+  local.audioQueue.push(clip);
   playNextLocalDub(currentSession);
 }
 
@@ -343,7 +418,7 @@ function playNextLocalDub(currentSession) {
   audio.playsInline = true;
   audio.hidden = true;
   audio.volume = clampVolume(currentSession.config.dubVolume);
-  audio.src = `data:${next.mimeType};base64,${next.audioBase64}`;
+  audio.src = `data:${next.mimeType || "audio/wav"};base64,${next.audioBase64}`;
   document.body.appendChild(audio);
   local.currentAudio = audio;
 
@@ -544,15 +619,6 @@ function isDubEnabled(outputMode) {
   return outputMode === "dub" || outputMode === "both";
 }
 
-function pickRecorderMimeType() {
-  const candidates = [
-    "audio/webm;codecs=opus",
-    "audio/webm",
-    "audio/ogg;codecs=opus"
-  ];
-  return candidates.find((type) => MediaRecorder.isTypeSupported(type)) || "";
-}
-
 function clampVolume(value) {
   const number = Number(value);
   return Number.isFinite(number) ? Math.min(1, Math.max(0, number)) : 1;
@@ -561,4 +627,29 @@ function clampVolume(value) {
 function clampInteger(value, min, max, fallback) {
   const number = Number(value);
   return Number.isFinite(number) ? Math.min(max, Math.max(min, Math.round(number))) : fallback;
+}
+
+function createRequestTimeoutSignal(timeoutMs) {
+  return typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function"
+    ? AbortSignal.timeout(timeoutMs)
+    : undefined;
+}
+
+function createLocalBackendError(status, data = {}) {
+  const backendMessage = typeof data.error === "string" && data.error.trim()
+    ? data.error.trim()
+    : `The local translation backend returned HTTP ${status}.`;
+  const prefix = status === 400
+    ? "The recorded audio chunk was rejected"
+    : status === 502
+      ? "The local backend could not decode the recorded audio"
+      : "The local translation backend failed";
+  const error = new Error(`${prefix}: ${backendMessage}`);
+  error.status = status;
+  error.code = data.code;
+  return error;
+}
+
+function logLocalChunkDiagnostic(event, payload) {
+  console.debug("[AutoTranslate local audio]", event, payload);
 }
