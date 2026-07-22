@@ -25,6 +25,19 @@ import {
   buildTranscriptionFromWhisperJson,
   buildTranscriptSegmentResponse
 } from "./whisperSegments.js";
+import {
+  OLLAMA_SEGMENT_ALIGNMENT_INVALID,
+  OLLAMA_SEGMENT_JSON_INVALID,
+  OLLAMA_SEGMENT_TRANSLATION_MISSING,
+  buildEmptyLocalChunkResponse,
+  buildLocalChunkSuccessResponse,
+  buildSegmentTranslationOllamaPayload,
+  buildTranslatedSegmentResponse,
+  resolveSegmentTranslationsWithRetry,
+  shouldTranslateDub,
+  shouldTranslateSubtitleSegments,
+  stripSourceTextFromSegments
+} from "./translatedSegments.js";
 
 dotenv.config();
 
@@ -228,7 +241,8 @@ app.post(
         return res.status(400).json({ error: "Choose an installed Ollama model before starting local translation." });
       }
 
-      const wantsDub = outputMode === "dub" || outputMode === "both";
+      const wantsSubtitles = shouldTranslateSubtitleSegments(outputMode);
+      const wantsDub = shouldTranslateDub(outputMode);
       if (wantsDub && !getPiperVoiceBank(targetLanguage).length) {
         return res.status(400).json({
           error: `No Piper voice is configured for ${LANGUAGE_LABELS.get(targetLanguage) || targetLanguage}. Use subtitles-only mode or add that language to PIPER_VOICES_JSON or PIPER_VOICE_BANK_JSON.`
@@ -243,22 +257,37 @@ app.post(
       await convertToWhisperWav(inputPath, wavPath);
       const transcription = await transcribeWithWhisper(wavPath, sourceLanguage, tempDir);
       const sourceText = transcription.text;
-      const transcriptSegments = buildTranscriptSegmentResponse({
+      const transcriptSegmentsWithSource = buildTranscriptSegmentResponse({
         segments: transcription.segments,
         metadata: chunkMetadata,
-        showSourceTranscript
+        showSourceTranscript: true
       });
+      const transcriptSegments = showSourceTranscript
+        ? transcriptSegmentsWithSource
+        : stripSourceTextFromSegments(transcriptSegmentsWithSource);
       const chunkTiming = buildChunkTimingResponseFields(chunkMetadata);
       if (!sourceText) {
-        return res.json({
-          ok: true,
-          empty: true,
-          ...chunkTiming,
-          transcriptSegments: []
+        return res.json(buildEmptyLocalChunkResponse({ chunkTiming }));
+      }
+
+      let translatedSegments = [];
+      if (wantsSubtitles) {
+        const segmentTranslation = await translateSegmentsWithOllama({
+          model: requestedModel,
+          sourceLanguage,
+          targetLanguage,
+          transcriptSegments: transcriptSegmentsWithSource,
+          sourceText,
+          sessionId
+        });
+        translatedSegments = buildTranslatedSegmentResponse({
+          transcriptSegments: transcriptSegmentsWithSource,
+          translatedSegments: segmentTranslation.translatedSegments,
+          showSourceTranscript
         });
       }
 
-      const translation = wantsDub
+      const dubTranslation = wantsDub
         ? await translateDialogueWithOllama({
             model: requestedModel,
             sourceLanguage,
@@ -267,18 +296,11 @@ app.post(
             sessionId
           })
         : {
-            translatedText: await translateWithOllama({
-              model: requestedModel,
-              sourceLanguage,
-              targetLanguage,
-              sourceText,
-              sessionId
-            }),
+            translatedText: "",
             turns: []
           };
-      const translatedText = translation.translatedText;
 
-      if (!translatedText) {
+      if (!wantsSubtitles && !dubTranslation.translatedText) {
         return res.json({
           ok: true,
           empty: true,
@@ -291,10 +313,10 @@ app.post(
       let audioBase64;
       let audioMime;
       const dubClips = [];
-      if (wantsDub) {
-        const turns = translation.turns.length
-          ? translation.turns
-          : [{ speakerId: "speaker_1", sourceText, translatedText }];
+      if (wantsDub && dubTranslation.translatedText) {
+        const turns = dubTranslation.turns.length
+          ? dubTranslation.turns
+          : [{ speakerId: "speaker_1", sourceText, translatedText: dubTranslation.translatedText }];
 
         for (const [index, turn] of turns.entries()) {
           const outputPath = path.join(tempDir, `dub-${index}.wav`);
@@ -312,19 +334,23 @@ app.post(
         audioMime = dubClips[0]?.audioMime;
       }
 
-      updateLocalContext(sessionId, sourceText, translatedText, translation.turns);
-      return res.json({
-        ok: true,
-        ...chunkTiming,
-        sourceText: showSourceTranscript ? sourceText : undefined,
-        translatedText,
+      const response = buildLocalChunkSuccessResponse({
+        outputMode,
+        chunkTiming,
+        sourceText,
+        showSourceTranscript,
         transcriptSegments,
-        turns: translation.turns,
+        translatedSegments,
+        dubTranslation,
         dubClips,
         audioBase64,
         audioMime,
         model: requestedModel
       });
+      if (response.translatedText) {
+        updateLocalContext(sessionId, sourceText, response.translatedText, dubTranslation.turns);
+      }
+      return res.json(response);
     } catch (error) {
       return sendRouteError(res, error, "The local Ollama translation pipeline failed.");
     } finally {
@@ -551,6 +577,82 @@ async function translateWithOllama({ model, sourceLanguage, targetLanguage, sour
   } catch {
     return cleanTranslation(content.replace(/^```(?:json)?\s*|\s*```$/g, ""));
   }
+}
+
+async function translateSegmentsWithOllama({ model, sourceLanguage, targetLanguage, transcriptSegments, sourceText, sessionId }) {
+  const sourceLabel = LANGUAGE_LABELS.get(sourceLanguage) || sourceLanguage;
+  const targetLabel = LANGUAGE_LABELS.get(targetLanguage) || targetLanguage;
+  const contextPairs = localContexts.get(sessionId)?.pairs ?? [];
+
+  try {
+    return await resolveSegmentTranslationsWithRetry({
+      transcriptSegments,
+      requestTranslation: async ({ request, corrective }) => {
+        const payload = buildSegmentTranslationOllamaPayload({
+          model,
+          sourceLabel,
+          targetLabel,
+          request,
+          contextPairs,
+          corrective
+        });
+        return fetchOllamaChatContent(payload, "Ollama did not return a text response for segment translation.");
+      },
+      fallbackTranslation: async () => translateWithOllama({
+        model,
+        sourceLanguage,
+        targetLanguage,
+        sourceText,
+        sessionId
+      })
+    });
+  } catch (error) {
+    if (error.code === OLLAMA_SEGMENT_JSON_INVALID) {
+      throw createHttpError(
+        502,
+        "Ollama did not return valid JSON for segment translation.",
+        OLLAMA_SEGMENT_JSON_INVALID,
+        true
+      );
+    }
+    if (
+      error.code === OLLAMA_SEGMENT_ALIGNMENT_INVALID ||
+      error.code === OLLAMA_SEGMENT_TRANSLATION_MISSING
+    ) {
+      throw createHttpError(
+        502,
+        "Ollama segment translations could not be aligned with transcript segments.",
+        error.code,
+        true
+      );
+    }
+    throw error;
+  }
+}
+
+async function fetchOllamaChatContent(payload, emptyMessage = "Ollama did not return a text response.") {
+  let response;
+  try {
+    response = await fetch(`${ollamaUrl}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: AbortSignal.timeout(localCommandTimeoutMs),
+      body: JSON.stringify(payload)
+    });
+  } catch (error) {
+    throw createHttpError(503, friendlyOllamaError(error));
+  }
+
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw createHttpError(response.status, body.error || `Ollama returned HTTP ${response.status}.`);
+  }
+
+  const content = body.message?.content;
+  if (typeof content !== "string") {
+    throw createHttpError(502, emptyMessage);
+  }
+  return content;
 }
 
 async function translateDialogueWithOllama({ model, sourceLanguage, targetLanguage, sourceText, sessionId }) {
