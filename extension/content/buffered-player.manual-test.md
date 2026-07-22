@@ -31,9 +31,27 @@ Use Chrome 116 or newer with the unpacked extension loaded.
 27. Use a case where the backend result arrives after a cue end and confirm the cue is dropped instead of shown late.
 28. Test overlapping speech segments and confirm at most two translated cues are displayed in chronological order.
 29. Rebuffer while a cue is active and confirm the visible subtitle is cleared or held only when the delayed source time still matches it.
-30. Stop translation while cues are queued and confirm the delayed video, overlay, and injected styles are removed and the original page video/audio are restored.
-31. Start a new buffered session after stopping and confirm stale timeline events and cues from the old session do not affect it.
-32. Repeat with Playback mode set to Live and confirm the buffered scheduler is not used and existing live behavior is unchanged.
-33. Choose OpenAI with Playback mode set to Buffered and confirm the popup shows the local-only validation instead of starting buffered playback.
-34. Run an OpenAI regression check and confirm streaming subtitles still appear immediately.
-35. Enter fullscreen and confirm the delayed player and subtitle overlay remain positioned correctly.
+30. Use buffered Dub only at 1x and confirm timed Piper clips play from the delayed video's displayed source position, not immediately when the backend response arrives.
+31. Use buffered Subtitles + dub at 1x and confirm subtitles and timed dub clips follow the same delayed source-time intervals.
+32. Confirm delayed original audio is muted while a dub-only timed clip is active and restored when the clip ends.
+33. Confirm delayed original audio is reduced, not fully muted, while a Subtitles + dub timed clip is active and restored when the clip ends.
+34. Pause while a timed dub clip is active and confirm translated audio pauses with delayed playback.
+35. Resume after a long pause and confirm translated audio resumes from the same decoded-audio position.
+36. Seek forward during an active timed dub clip and confirm old audio stops and does not resume after rebuffering.
+37. Seek backward during queued timed dub clips and confirm old-generation clips are discarded.
+38. Perform repeated rapid seeks and confirm late decode completions from earlier generations do not play.
+39. Test timed dub at 0.5x and confirm clip start decisions follow the delayed visible content.
+40. Test timed dub at 1.5x and confirm clip start decisions follow the delayed visible content.
+41. Test timed dub at 2x and confirm clip start decisions follow the delayed visible content.
+42. Use a case where a timed dub clip is available before its start and confirm it waits.
+43. Use a case where a timed dub clip arrives during its interval and confirm playback starts at a proportional audio offset.
+44. Use a case where a timed dub clip arrives after its interval and confirm it is dropped.
+45. Use a clip longer than its source interval and confirm runtime playback stops at the interval end without time stretching.
+46. Use a clip shorter than its source interval and confirm it finishes naturally.
+47. Test overlapping timed dub clips and confirm at most two play at once.
+48. Stop translation with active timed audio and confirm all translated audio stops and delayed original audio volume is restored.
+49. Start another buffered session and confirm stale timed dub clips from the old session do not play.
+50. Switch back to Live mode and confirm the timed dub scheduler is not injected and Live dubbing remains immediate.
+51. Run an OpenAI audio regression check and confirm the realtime translated audio path remains unchanged.
+52. Enter fullscreen and confirm delayed video, subtitles, and timed dub behavior remain tied to the same buffered playback session.
+53. Test an autoplay-blocked page state and confirm one clear timed dub playback error is reported instead of repeated per-clip errors.

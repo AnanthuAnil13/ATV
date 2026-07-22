@@ -634,7 +634,16 @@ async function processLocalQueue(currentSession) {
       }
       if (isDubEnabled(currentSession.config.outputMode)) {
         if (shouldUseBufferedTimedDubClips(currentSession.config)) {
-          notePreparedTimedDubClips(result, item);
+          const timedDubClips = normalizeBufferedTimedDubClips(result, item, currentSession);
+          if (timedDubClips.length) {
+            notifyBufferedTimedDubClips({
+              tabId: currentSession.config.tabId,
+              bufferedSessionId: local.bufferedSessionId,
+              generation: item.metadata.generation,
+              sequence: item.metadata.sequence,
+              timedDubClips
+            });
+          }
           continue;
         }
 
@@ -923,6 +932,13 @@ function notifyBufferedSubtitleSegments(payload) {
   }).catch(() => null);
 }
 
+function notifyBufferedTimedDubClips(payload) {
+  chrome.runtime.sendMessage({
+    type: "OFFSCREEN_BUFFERED_TIMED_DUB_CLIPS",
+    payload
+  }).catch(() => null);
+}
+
 function shouldUseBufferedSubtitleSegments(config) {
   return config?.provider === "ollama" &&
     config?.syncMode === "buffered" &&
@@ -933,18 +949,6 @@ function shouldUseBufferedTimedDubClips(config) {
   return config?.provider === "ollama" &&
     config?.syncMode === "buffered" &&
     (config?.outputMode === "dub" || config?.outputMode === "both");
-}
-
-function notePreparedTimedDubClips(result, item) {
-  const clips = Array.isArray(result?.timedDubClips) ? result.timedDubClips : [];
-  if (!clips.length) return;
-  console.debug("[AutoTranslate offscreen] timed dub clips prepared", {
-    generation: item.metadata.generation,
-    sequence: item.metadata.sequence,
-    clipCount: clips.length,
-    firstStartMs: finiteDebugNumber(clips[0]?.startMs),
-    lastEndMs: finiteDebugNumber(clips.at(-1)?.endMs)
-  });
 }
 
 function normalizeBufferedSubtitleSegments(result, item, currentSession) {
@@ -994,6 +998,71 @@ function normalizeBufferedSubtitleSegments(result, item, currentSession) {
   });
 }
 
+function normalizeBufferedTimedDubClips(result, item, currentSession) {
+  const local = currentSession.local;
+  if (!local?.bufferedSessionId) {
+    throw new Error("Timed dub clips cannot be scheduled without a buffered session ID.");
+  }
+  if (!Array.isArray(result?.timedDubClips)) {
+    throw new Error("The local backend did not return timed dub clips.");
+  }
+  if (Number(result.generation) !== item.metadata.generation || Number(result.sequence) !== item.metadata.sequence) {
+    throw new Error("The local backend returned timed dub clips for the wrong chunk.");
+  }
+
+  const seenIds = new Set();
+  return result.timedDubClips.map((clip) => {
+    const id = typeof clip?.id === "string" ? clip.id.trim().slice(0, 160) : "";
+    const generation = Number(clip?.generation);
+    const sequence = Number(clip?.sequence);
+    const startMs = Number(clip?.startMs);
+    const endMs = Number(clip?.endMs);
+    const audioDurationMs = Number(clip?.audioDurationMs);
+    const targetWindowDurationMs = Number(clip?.targetWindowDurationMs);
+    const durationRatio = Number(clip?.durationRatio);
+    const speakerId = sanitizePublicIdentifier(clip?.speakerId, 80);
+    const voiceId = sanitizePublicIdentifier(clip?.voiceId, 160);
+    const audioMime = sanitizeTimedDubAudioMime(clip?.audioMime);
+    const audioBase64 = sanitizeTimedDubAudioBase64(clip?.audioBase64);
+
+    if (!id) throw new Error("The local backend returned a timed dub clip without an ID.");
+    if (seenIds.has(id)) throw new Error("The local backend returned duplicate timed dub clip IDs.");
+    seenIds.add(id);
+    if (generation !== item.metadata.generation || sequence !== item.metadata.sequence) {
+      throw new Error("The local backend returned timed dub clip metadata for the wrong chunk.");
+    }
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || startMs < 0 || endMs <= startMs) {
+      throw new Error("The local backend returned invalid timed dub clip timing.");
+    }
+    if (!Number.isFinite(audioDurationMs) || audioDurationMs <= 0 || !audioMime || !audioBase64) {
+      throw new Error("The local backend returned invalid timed dub audio.");
+    }
+    if (!speakerId || !voiceId) {
+      throw new Error("The local backend returned invalid timed dub speaker metadata.");
+    }
+
+    return {
+      id,
+      bufferedSessionId: local.bufferedSessionId,
+      generation: item.metadata.generation,
+      sequence: item.metadata.sequence,
+      startMs,
+      endMs,
+      speakerId,
+      voiceId,
+      audioBase64,
+      audioMime,
+      audioDurationMs,
+      targetWindowDurationMs: Number.isFinite(targetWindowDurationMs) && targetWindowDurationMs > 0
+        ? targetWindowDurationMs
+        : endMs - startMs,
+      durationRatio: Number.isFinite(durationRatio) && durationRatio > 0
+        ? durationRatio
+        : audioDurationMs / Math.max(1, endMs - startMs)
+    };
+  });
+}
+
 function assertCurrentSession(expectedSession) {
   if (session !== expectedSession) {
     throw new DOMException("Translation start was cancelled.", "AbortError");
@@ -1026,9 +1095,23 @@ function isDubEnabled(outputMode) {
   return outputMode === "dub" || outputMode === "both";
 }
 
-function finiteDebugNumber(value) {
-  const number = Number(value);
-  return Number.isFinite(number) ? number : undefined;
+function sanitizePublicIdentifier(value, maxLength) {
+  if (typeof value !== "string") return "";
+  const normalized = value.trim().slice(0, maxLength);
+  return /^[A-Za-z0-9_-]+$/.test(normalized) ? normalized : "";
+}
+
+function sanitizeTimedDubAudioMime(value) {
+  const mime = typeof value === "string" ? value.trim().toLowerCase() : "";
+  return ["audio/wav", "audio/wave", "audio/x-wav", "audio/vnd.wave"].includes(mime) ? mime : "";
+}
+
+function sanitizeTimedDubAudioBase64(value) {
+  if (typeof value !== "string") return "";
+  const compact = value.replace(/\s+/g, "");
+  if (!compact || compact.length > 8 * 1024 * 1024 || compact.length % 4 !== 0) return "";
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(compact)) return "";
+  return compact;
 }
 
 function clampVolume(value) {

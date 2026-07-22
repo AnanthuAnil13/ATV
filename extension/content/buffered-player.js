@@ -12,6 +12,7 @@
 
   let controller = null;
   let clockApiController = null;
+  let audioControlApiController = null;
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message?.type === "BUFFERED_PLAYER_START") {
@@ -71,12 +72,14 @@
     const nextController = createController(config);
     controller = nextController;
     installPlaybackClockApi(nextController);
+    installPlaybackAudioControlApi(nextController);
     try {
       await nextController.start();
       return nextController.publicStatus();
     } catch (error) {
       if (controller === nextController) controller = null;
       removePlaybackClockApi(nextController);
+      removePlaybackAudioControlApi(nextController);
       await nextController.stop({ removeRoot: true, report: false });
       throw error;
     }
@@ -88,6 +91,7 @@
     controller = null;
     await oldController.stop({ removeRoot: true, report: true });
     removePlaybackClockApi(oldController);
+    removePlaybackAudioControlApi(oldController);
   }
 
   function installPlaybackClockApi(targetController) {
@@ -111,6 +115,30 @@
     clockApiController = null;
     try { delete window.AutoTranslateBufferedPlaybackClock; } catch {
       window.AutoTranslateBufferedPlaybackClock = undefined;
+    }
+  }
+
+  function installPlaybackAudioControlApi(targetController) {
+    audioControlApiController = targetController;
+    window.AutoTranslateBufferedPlaybackAudioControl = Object.freeze({
+      setTimedDubActivity(payload) {
+        return audioControlApiController === targetController
+          ? targetController.setTimedDubActivity(payload)
+          : false;
+      },
+      resetTimedDubActivity(payload) {
+        return audioControlApiController === targetController
+          ? targetController.resetTimedDubActivity(payload)
+          : false;
+      }
+    });
+  }
+
+  function removePlaybackAudioControlApi(targetController) {
+    if (audioControlApiController !== targetController) return;
+    audioControlApiController = null;
+    try { delete window.AutoTranslateBufferedPlaybackAudioControl; } catch {
+      window.AutoTranslateBufferedPlaybackAudioControl = undefined;
     }
   }
 
@@ -177,7 +205,9 @@
       publicStatus,
       timelineSnapshot,
       playbackClockSnapshot,
-      subscribeClock
+      subscribeClock,
+      setTimedDubActivity,
+      resetTimedDubActivity
     };
 
     async function start() {
@@ -223,6 +253,7 @@
       state.resizeObserver = null;
 
       state.pipelineEpoch += 1;
+      resetTimedDubActivity({ bufferedSessionId: state.bufferedSessionId, generation: state.generation });
       teardownMediaPipeline({ keepVideoElement: false });
 
       restoreSourceVideo();
@@ -290,6 +321,30 @@
         state.clockSubscribers.delete(listener);
         if (!state.clockSubscribers.size) stopClockPump();
       };
+    }
+
+    function setTimedDubActivity(payload = {}) {
+      if (!isValidAudioControlPayload(payload)) return false;
+      const activeClipCount = normalizeNonNegativeInteger(payload.activeClipCount);
+      const originalVolume = state.config.originalVolume;
+      if (!state.delayedVideo || activeClipCount === null) return false;
+      state.delayedVideo.volume = activeClipCount > 0
+        ? duckedOriginalVolume(originalVolume, state.config.outputMode)
+        : originalVolume;
+      return true;
+    }
+
+    function resetTimedDubActivity(payload = {}) {
+      if (payload.bufferedSessionId && payload.bufferedSessionId !== state.bufferedSessionId) return false;
+      if (payload.generation !== undefined && Number(payload.generation) !== state.generation) return false;
+      if (state.delayedVideo) state.delayedVideo.volume = state.config.originalVolume;
+      return true;
+    }
+
+    function isValidAudioControlPayload(payload = {}) {
+      if (payload.bufferedSessionId !== state.bufferedSessionId) return false;
+      if (Number(payload.generation) !== state.generation) return false;
+      return normalizeNonNegativeInteger(payload.activeClipCount) !== null;
     }
 
     function notifyClockSubscribers() {
@@ -966,6 +1021,7 @@
           delayedSourceTimeMs: playbackClockSnapshot().delayedSourceTimeMs,
           sourceTime: state.sourceVideo?.currentTime,
           sequence: state.lastAppendedSequence,
+          pipelineEpoch: state.pipelineEpoch,
           ...extra
         }
       }).catch(() => null);
@@ -1106,6 +1162,19 @@
   function clampVolume(value) {
     const number = Number(value);
     return Number.isFinite(number) ? Math.min(1, Math.max(0, number)) : 1;
+  }
+
+  function duckedOriginalVolume(originalVolume, outputMode) {
+    const volume = clampVolume(originalVolume);
+    if (outputMode === "dub") return 0;
+    if (outputMode === "both") return clampVolume(volume * 0.2);
+    return volume;
+  }
+
+  function normalizeNonNegativeInteger(value) {
+    if (value === null || value === undefined || value === "") return null;
+    const number = Number(value);
+    return Number.isInteger(number) && number >= 0 ? number : null;
   }
 
   function mediaSecondsToMs(value) {
