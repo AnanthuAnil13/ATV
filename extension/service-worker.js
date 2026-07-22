@@ -1,3 +1,10 @@
+import {
+  clampInitialBufferSeconds,
+  normalizeSyncMode,
+  shouldActivateBufferedPlayer,
+  validatePlaybackMode
+} from "./shared/playback-settings.js";
+
 const OFFSCREEN_DOCUMENT_PATH = "offscreen/offscreen.html";
 const DEFAULT_SETTINGS = {
   backendUrl: "http://localhost:8787",
@@ -8,7 +15,9 @@ const DEFAULT_SETTINGS = {
   outputMode: "both",
   originalVolume: 0.15,
   dubVolume: 1,
-  showSourceTranscript: false
+  showSourceTranscript: false,
+  syncMode: "live",
+  initialBufferSeconds: 10
 };
 
 let creatingOffscreenDocument = null;
@@ -79,6 +88,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return false;
   }
 
+  if (message.type === "BUFFERED_PLAYER_STATUS") {
+    handleBufferedPlayerStatus(message.payload).catch(console.error);
+    return false;
+  }
+
   return false;
 });
 
@@ -102,10 +116,13 @@ async function startTranslation(payload = {}) {
     outputMode: normalizeOutputMode(payload.outputMode ?? stored.outputMode),
     originalVolume: clampVolume(payload.originalVolume ?? stored.originalVolume),
     dubVolume: clampVolume(payload.dubVolume ?? stored.dubVolume),
+    syncMode: normalizeSyncMode(payload.syncMode ?? stored.syncMode),
+    initialBufferSeconds: clampInitialBufferSeconds(payload.initialBufferSeconds ?? stored.initialBufferSeconds),
     ollamaModel: String(payload.ollamaModel ?? stored.ollamaModel ?? "").trim(),
     tabId: tab.id
   };
 
+  validatePlaybackMode(settings);
   if (settings.sourceLanguage === settings.targetLanguage) {
     throw new Error("Source and translation languages must be different.");
   }
@@ -116,6 +133,7 @@ async function startTranslation(payload = {}) {
   const subtitlesEnabled = settings.outputMode !== "dub";
   const dubEnabled = settings.outputMode !== "subtitles";
   const showSourceTranscript = subtitlesEnabled && Boolean(settings.showSourceTranscript);
+  const bufferedPlayerEnabled = shouldActivateBufferedPlayer(settings);
 
   await setSessionState({
     status: "starting",
@@ -125,6 +143,10 @@ async function startTranslation(payload = {}) {
     provider: settings.provider,
     ollamaModel: settings.provider === "ollama" ? settings.ollamaModel : null,
     outputMode: settings.outputMode,
+    syncMode: settings.syncMode,
+    initialBufferSeconds: settings.initialBufferSeconds,
+    bufferedPlayerEnabled,
+    bufferedPlayer: bufferedPlayerEnabled ? { status: "idle" } : null,
     subtitlesEnabled,
     dubEnabled,
     error: null
@@ -163,6 +185,8 @@ async function startTranslation(payload = {}) {
       sourceLanguage: settings.sourceLanguage,
       targetLanguage: settings.targetLanguage,
       outputMode: settings.outputMode,
+      syncMode: settings.syncMode,
+      initialBufferSeconds: settings.initialBufferSeconds,
       originalVolume: settings.originalVolume,
       dubVolume: settings.dubVolume,
       showSourceTranscript,
@@ -177,11 +201,38 @@ async function startTranslation(payload = {}) {
     throw new Error(response?.error || "The offscreen translation session could not be started.");
   }
 
+  if (bufferedPlayerEnabled) {
+    try {
+      await injectBufferedPlayer(tab.id, {
+        tabId: tab.id,
+        provider: settings.provider,
+        syncMode: settings.syncMode,
+        initialBufferSeconds: settings.initialBufferSeconds,
+        originalVolume: settings.originalVolume,
+        outputMode: settings.outputMode
+      });
+    } catch (error) {
+      await chrome.runtime.sendMessage({
+        type: "OFFSCREEN_STOP",
+        target: "offscreen",
+        payload: { notify: false }
+      }).catch(() => null);
+      if (subtitlesEnabled) {
+        await chrome.tabs.sendMessage(tab.id, { type: "OVERLAY_STOP" }).catch(() => null);
+      }
+      await stopBufferedPlayer(tab.id).catch(() => null);
+      throw error;
+    }
+  }
+
   return { tabId: tab.id };
 }
 
 async function stopTranslation() {
   const { translationState } = await chrome.storage.session.get("translationState");
+  if (translationState?.tabId && translationState?.bufferedPlayerEnabled) {
+    await stopBufferedPlayer(translationState.tabId).catch(() => null);
+  }
   await chrome.runtime.sendMessage({ type: "OFFSCREEN_STOP", target: "offscreen" }).catch(() => null);
 
   if (translationState?.tabId && translationState?.subtitlesEnabled) {
@@ -195,6 +246,9 @@ async function handleOffscreenStatus(payload = {}) {
   const { translationState } = await chrome.storage.session.get("translationState");
   const tabId = payload.tabId ?? translationState?.tabId ?? null;
   const isIdle = payload.status === "idle";
+  if (tabId && translationState?.bufferedPlayerEnabled && (isIdle || payload.status === "error")) {
+    await stopBufferedPlayer(tabId).catch(() => null);
+  }
   await setSessionState({ ...payload, tabId: isIdle ? null : tabId });
 
   if (tabId && translationState?.subtitlesEnabled) {
@@ -268,6 +322,69 @@ async function injectSubtitleOverlay(tabId) {
   });
 }
 
+async function injectBufferedPlayer(tabId, payload) {
+  await chrome.scripting.insertCSS({
+    target: { tabId },
+    files: ["content/buffered-player.css"]
+  }).catch(() => null);
+
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    files: ["content/buffered-player-core.js", "content/buffered-player.js"]
+  });
+
+  const response = await chrome.tabs.sendMessage(tabId, {
+    type: "BUFFERED_PLAYER_START",
+    payload
+  });
+  if (!response?.ok) {
+    throw new Error(response?.error || "The buffered video player could not be started.");
+  }
+}
+
+async function stopBufferedPlayer(tabId) {
+  await chrome.tabs.sendMessage(tabId, { type: "BUFFERED_PLAYER_STOP" }).catch(() => null);
+  await chrome.scripting.removeCSS({
+    target: { tabId },
+    files: ["content/buffered-player.css"]
+  }).catch(() => null);
+}
+
+async function handleBufferedPlayerStatus(payload = {}) {
+  const { translationState } = await chrome.storage.session.get("translationState");
+  const tabId = payload.tabId ?? translationState?.tabId ?? null;
+  if (!tabId || translationState?.tabId !== tabId || !translationState?.bufferedPlayerEnabled) return;
+
+  const bufferedPlayer = sanitizeBufferedPlayerStatus(payload);
+  if (bufferedPlayer.status === "error") {
+    await chrome.runtime.sendMessage({
+      type: "OFFSCREEN_STOP",
+      target: "offscreen",
+      payload: { notify: false }
+    }).catch(() => null);
+    if (translationState.subtitlesEnabled) {
+      await chrome.tabs.sendMessage(tabId, { type: "OVERLAY_STOP" }).catch(() => null);
+    }
+    await setSessionState({
+      status: "error",
+      tabId,
+      provider: translationState.provider,
+      outputMode: translationState.outputMode,
+      syncMode: translationState.syncMode,
+      initialBufferSeconds: translationState.initialBufferSeconds,
+      bufferedPlayer,
+      error: bufferedPlayer.error || "The buffered video player failed."
+    });
+    return;
+  }
+
+  await setSessionState({
+    status: translationState.status || "connected",
+    tabId,
+    bufferedPlayer
+  });
+}
+
 async function setSessionState(patch) {
   const { translationState } = await chrome.storage.session.get("translationState");
   await chrome.storage.session.set({
@@ -299,4 +416,28 @@ function normalizeOutputMode(value) {
 function clampVolume(value) {
   const number = Number(value);
   return Number.isFinite(number) ? Math.min(1, Math.max(0, number)) : 1;
+}
+
+function sanitizeBufferedPlayerStatus(payload = {}) {
+  const allowedStatus = new Set(["buffering", "playing", "paused", "ended", "error", "stopped"]);
+  const status = allowedStatus.has(payload.status) ? payload.status : "buffering";
+  return {
+    status,
+    error: sanitizeError(payload.error),
+    bufferedSeconds: sanitizeNumber(payload.bufferedSeconds),
+    currentTime: sanitizeNumber(payload.currentTime),
+    sourceTime: sanitizeNumber(payload.sourceTime),
+    sequence: Number.isInteger(payload.sequence) ? payload.sequence : undefined,
+    updatedAt: Date.now()
+  };
+}
+
+function sanitizeError(value) {
+  if (typeof value !== "string") return undefined;
+  return value.replace(/\s+/g, " ").trim().slice(0, 240) || undefined;
+}
+
+function sanitizeNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : undefined;
 }

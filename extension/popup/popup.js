@@ -1,3 +1,9 @@
+import {
+  clampInitialBufferSeconds,
+  normalizeSyncMode,
+  validatePlaybackMode
+} from "../shared/playback-settings.js";
+
 const DEFAULT_SETTINGS = {
   backendUrl: "http://localhost:8787",
   provider: "openai",
@@ -7,7 +13,9 @@ const DEFAULT_SETTINGS = {
   outputMode: "both",
   originalVolume: 0.15,
   dubVolume: 1,
-  showSourceTranscript: false
+  showSourceTranscript: false,
+  syncMode: "live",
+  initialBufferSeconds: 10
 };
 
 const FALLBACK_LANGUAGES = [
@@ -56,6 +64,10 @@ const els = {
   sourceLanguageHelp: document.querySelector("#sourceLanguageHelp"),
   targetLanguage: document.querySelector("#targetLanguage"),
   outputMode: document.querySelector("#outputMode"),
+  syncMode: document.querySelector("#syncMode"),
+  playbackModeHelp: document.querySelector("#playbackModeHelp"),
+  initialBufferRow: document.querySelector("#initialBufferRow"),
+  initialBufferSeconds: document.querySelector("#initialBufferSeconds"),
   originalVolume: document.querySelector("#originalVolume"),
   originalVolumeValue: document.querySelector("#originalVolumeValue"),
   dubVolume: document.querySelector("#dubVolume"),
@@ -88,12 +100,15 @@ async function init() {
   refreshTargetLanguages(settings.targetLanguage);
 
   els.outputMode.value = normalizeOutputMode(settings.outputMode);
+  els.syncMode.value = normalizeSyncMode(settings.syncMode);
+  els.initialBufferSeconds.value = clampInitialBufferSeconds(settings.initialBufferSeconds);
   els.originalVolume.value = Math.round(clampVolume(settings.originalVolume) * 100);
   els.dubVolume.value = Math.round(clampVolume(settings.dubVolume) * 100);
   els.showSourceTranscript.checked = settings.showSourceTranscript;
   syncVolumeLabels();
   updateProviderUi(false);
   updateModeUi(false);
+  updatePlaybackUi(false);
 
   els.startButton.addEventListener("click", startTranslation);
   els.stopButton.addEventListener("click", stopTranslation);
@@ -105,6 +120,7 @@ async function init() {
     populateOllamaModels(els.ollamaModel.value);
     updateProviderUi(false);
     updateModeUi(false);
+    updatePlaybackUi(false);
     await persistControls();
   });
   els.ollamaModel.addEventListener("change", persistControls);
@@ -113,11 +129,20 @@ async function init() {
     updateModeUi(false);
     await persistControls();
   });
+  els.syncMode.addEventListener("change", async () => {
+    updatePlaybackUi(false);
+    await persistControls();
+  });
+  els.initialBufferSeconds.addEventListener("change", async () => {
+    els.initialBufferSeconds.value = clampInitialBufferSeconds(els.initialBufferSeconds.value);
+    await persistControls();
+  });
   els.showSourceTranscript.addEventListener("change", persistControls);
   els.sourceLanguage.addEventListener("change", persistControls);
   els.targetLanguage.addEventListener("change", async () => {
     updateProviderUi(false);
     updateModeUi(false);
+    updatePlaybackUi(false);
     await persistControls();
   });
   els.originalVolume.addEventListener("input", syncVolumeLabels);
@@ -213,7 +238,12 @@ async function startTranslation() {
     if (!providerSupportsSelectedMode()) {
       throw new Error("The selected provider is not configured for this output mode and target language.");
     }
+    validatePlaybackMode({
+      provider: els.provider.value,
+      syncMode: els.syncMode.value
+    });
 
+    els.initialBufferSeconds.value = clampInitialBufferSeconds(els.initialBufferSeconds.value);
     await persistControls();
     showMessage(els.provider.value === "ollama"
       ? "Starting the local Whisper → Ollama pipeline…"
@@ -229,6 +259,8 @@ async function startTranslation() {
         sourceLanguage: els.sourceLanguage.value,
         targetLanguage: els.targetLanguage.value,
         outputMode: els.outputMode.value,
+        syncMode: els.syncMode.value,
+        initialBufferSeconds: Number(els.initialBufferSeconds.value),
         originalVolume: Number(els.originalVolume.value) / 100,
         dubVolume: Number(els.dubVolume.value) / 100,
         showSourceTranscript: els.showSourceTranscript.checked
@@ -264,6 +296,8 @@ async function persistControls() {
     sourceLanguage: els.sourceLanguage.value,
     targetLanguage: els.targetLanguage.value,
     outputMode: els.outputMode.value,
+    syncMode: els.syncMode.value,
+    initialBufferSeconds: clampInitialBufferSeconds(els.initialBufferSeconds.value),
     originalVolume: Number(els.originalVolume.value) / 100,
     dubVolume: Number(els.dubVolume.value) / 100,
     showSourceTranscript: els.showSourceTranscript.checked
@@ -284,25 +318,35 @@ function renderState(state) {
   const active = ["starting", "connected", "reconnecting"].includes(status);
   updateProviderUi(active);
   updateModeUi(active);
-  els.startButton.disabled = active || !providerSupportsSelectedMode();
+  updatePlaybackUi(active);
+  if (status === "connected" && state.syncMode === "buffered") {
+    els.statusBadge.textContent = "Buffered";
+  }
+  els.startButton.disabled = active || !providerSupportsSelectedMode() || !playbackModeSupported();
   els.stopButton.disabled = !active && status !== "error";
   els.sourceLanguage.disabled = active;
   els.targetLanguage.disabled = active;
   els.provider.disabled = active;
   els.ollamaModel.disabled = active || els.provider.value !== "ollama" || !els.ollamaModel.value;
   els.outputMode.disabled = active;
+  els.syncMode.disabled = active;
+  els.initialBufferSeconds.disabled = active || normalizeSyncMode(els.syncMode.value) !== "buffered";
   els.originalVolume.disabled = active;
 
   const provider = state.provider || els.provider.value;
   if (status === "connected") {
     const providerName = provider === "ollama" ? "Ollama local" : "OpenAI Realtime";
-    showMessage(`${modeLabel(state.outputMode || els.outputMode.value)} is live through ${providerName}. Keep this video tab open.`);
+    if (state.syncMode === "buffered") {
+      showBufferedPlayerMessage(state);
+    } else {
+      showMessage(`${modeLabel(state.outputMode || els.outputMode.value)} is live through ${providerName}. Keep this video tab open.`);
+    }
   } else if (status === "reconnecting") {
     showMessage("The realtime connection is reconnecting…");
   } else if (status === "error") {
     showMessage(state.error || "The translation session failed.", true);
   } else if (status === "idle") {
-    showMessage("Open a Japanese video, press play, choose an engine and mode, then start.");
+    showMessage("Open a Japanese video, press play, choose an engine, playback mode, and output mode, then start.");
   }
 }
 
@@ -382,6 +426,28 @@ function updateModeUi(active) {
   }[mode];
 }
 
+function updatePlaybackUi(active) {
+  const syncMode = normalizeSyncMode(els.syncMode.value);
+  const isBuffered = syncMode === "buffered";
+  const supported = playbackModeSupported();
+
+  els.initialBufferRow.hidden = !isBuffered;
+  els.initialBufferSeconds.disabled = active || !isBuffered;
+  if (isBuffered && document.activeElement !== els.initialBufferSeconds) {
+    els.initialBufferSeconds.value = clampInitialBufferSeconds(els.initialBufferSeconds.value);
+  }
+
+  els.playbackModeHelp.classList.toggle("error", !supported);
+  els.playbackModeHelp.textContent = !supported
+    ? "Buffered playback is currently only available with Ollama local mode."
+    : isBuffered
+      ? "The source video runs ahead while a delayed visible copy buffers."
+      : "Live leaves the page video timing unchanged.";
+  if (!active) {
+    els.startButton.disabled = !providerSupportsSelectedMode() || !supported;
+  }
+}
+
 function providerSupportsSelectedMode() {
   const provider = normalizeProvider(els.provider.value);
   const capability = providers[provider] || FALLBACK_PROVIDERS[provider];
@@ -391,6 +457,18 @@ function providerSupportsSelectedMode() {
   if (mode === "subtitles") return capability?.supportsSubtitles !== false;
   if (provider === "openai") return capability?.supportsDub !== false;
   return capability?.supportsDub === true && (capability.dubTargets || []).includes(els.targetLanguage.value);
+}
+
+function playbackModeSupported() {
+  try {
+    validatePlaybackMode({
+      provider: normalizeProvider(els.provider.value),
+      syncMode: normalizeSyncMode(els.syncMode.value)
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function applyModePreset(mode) {
@@ -434,6 +512,24 @@ function modeLabel(mode) {
     subtitles: "Subtitles",
     dub: "Dub"
   }[normalizeOutputMode(mode)];
+}
+
+function showBufferedPlayerMessage(state) {
+  const player = state.bufferedPlayer || {};
+  const target = clampInitialBufferSeconds(state.initialBufferSeconds ?? els.initialBufferSeconds.value);
+  const buffered = Number.isFinite(player.bufferedSeconds)
+    ? ` (${Math.min(player.bufferedSeconds, target).toFixed(1)} / ${target}s)`
+    : "";
+
+  if (player.status === "playing") {
+    showMessage("Delayed buffered video playback is running through Ollama local. Subtitle and dub timing are not synchronized yet.");
+  } else if (player.status === "paused") {
+    showMessage("The source video is paused; delayed buffered playback is paused too.");
+  } else if (player.status === "ended") {
+    showMessage("The delayed buffered video reached the end of the captured source media.");
+  } else {
+    showMessage(`Buffering delayed video playback${buffered}. Keep the source video playing.`);
+  }
 }
 
 function showMessage(text, isError = false) {

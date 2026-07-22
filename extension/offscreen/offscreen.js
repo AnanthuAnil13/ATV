@@ -5,6 +5,12 @@ import {
   pickAudioRecorderMimeType,
   validateStandaloneAudioBlob
 } from "./local-chunks.js";
+import {
+  clampInitialBufferSeconds,
+  normalizeSyncMode,
+  shouldActivateBufferedPlayer,
+  validatePlaybackMode
+} from "../shared/playback-settings.js";
 
 let session = null;
 
@@ -20,7 +26,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           notifyStatus("error", {
             error: error.message,
             tabId: message.payload?.tabId,
-            provider: message.payload?.provider
+            provider: message.payload?.provider,
+            syncMode: message.payload?.syncMode
           });
         }
         sendResponse({ ok: false, error: error.message });
@@ -29,7 +36,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === "OFFSCREEN_STOP") {
-    stopSession({ notify: true })
+    stopSession({ notify: message.payload?.notify !== false })
       .then(() => sendResponse({ ok: true }))
       .catch((error) => sendResponse({ ok: false, error: error.message }));
     return true;
@@ -59,7 +66,8 @@ async function startSession(config) {
   notifyStatus("starting", {
     tabId: config.tabId,
     outputMode: config.outputMode,
-    provider: config.provider
+    provider: config.provider,
+    syncMode: config.syncMode
   });
 
   currentSession.sourceStream = await navigator.mediaDevices.getUserMedia({
@@ -91,7 +99,7 @@ async function startSession(config) {
 
   currentSession.sourceNode = currentSession.audioContext.createMediaStreamSource(currentSession.sourceStream);
   currentSession.originalGain = currentSession.audioContext.createGain();
-  currentSession.originalGain.gain.value = clampVolume(config.originalVolume);
+  currentSession.originalGain.gain.value = shouldMuteLiveOriginal(config) ? 0 : clampVolume(config.originalVolume);
   currentSession.sourceNode.connect(currentSession.originalGain).connect(currentSession.audioContext.destination);
 
   if (config.provider === "ollama") {
@@ -128,25 +136,29 @@ async function startOpenAiSession(currentSession) {
       notifyStatus("connected", {
         tabId: config.tabId,
         outputMode: config.outputMode,
-        provider: config.provider
+        provider: config.provider,
+        syncMode: config.syncMode
       });
     } else if (state === "disconnected") {
       notifyStatus("reconnecting", {
         tabId: config.tabId,
         outputMode: config.outputMode,
-        provider: config.provider
+        provider: config.provider,
+        syncMode: config.syncMode
       });
     } else if (state === "connecting") {
       notifyStatus(currentSession.hasConnected ? "reconnecting" : "starting", {
         tabId: config.tabId,
         outputMode: config.outputMode,
-        provider: config.provider
+        provider: config.provider,
+        syncMode: config.syncMode
       });
     } else if (state === "failed") {
       notifyStatus("error", {
         tabId: config.tabId,
         outputMode: config.outputMode,
         provider: config.provider,
+        syncMode: config.syncMode,
         error: "The OpenAI realtime translation connection failed."
       });
     }
@@ -160,6 +172,7 @@ async function startOpenAiSession(currentSession) {
       tabId: config.tabId,
       outputMode: config.outputMode,
       provider: config.provider,
+      syncMode: config.syncMode,
       error: "The OpenAI realtime translation event channel failed."
     });
   };
@@ -214,6 +227,7 @@ async function startOllamaLocalSession(currentSession) {
     tabId: currentSession.config.tabId,
     outputMode: currentSession.config.outputMode,
     provider: currentSession.config.provider,
+    syncMode: currentSession.config.syncMode,
     model: currentSession.config.ollamaModel
   });
   startNextLocalRecording(currentSession);
@@ -449,6 +463,7 @@ function failLocalSession(currentSession, error) {
     tabId: currentSession.config.tabId,
     outputMode: currentSession.config.outputMode,
     provider: currentSession.config.provider,
+    syncMode: currentSession.config.syncMode,
     error: error?.message || "The local translation pipeline failed."
   });
   stopSession({ notify: false }).catch(console.error);
@@ -472,6 +487,7 @@ function attachTranslatedAudio(currentSession, track, suppliedStream) {
       tabId: currentSession.config.tabId,
       outputMode: currentSession.config.outputMode,
       provider: currentSession.config.provider,
+      syncMode: currentSession.config.syncMode,
       error: "The translated audio track was received but could not be played."
     });
   });
@@ -533,6 +549,7 @@ function handleRealtimeEvent(rawData, config) {
       tabId: config.tabId,
       outputMode: config.outputMode,
       provider: config.provider,
+      syncMode: config.syncMode,
       error: message
     });
   }
@@ -613,6 +630,9 @@ function validateConfig(config) {
   if (!["subtitles", "dub", "both"].includes(config?.outputMode)) {
     throw new Error("Invalid translation output mode.");
   }
+  config.syncMode = normalizeSyncMode(config.syncMode);
+  config.initialBufferSeconds = clampInitialBufferSeconds(config.initialBufferSeconds);
+  validatePlaybackMode(config);
 }
 
 function isDubEnabled(outputMode) {
@@ -627,6 +647,10 @@ function clampVolume(value) {
 function clampInteger(value, min, max, fallback) {
   const number = Number(value);
   return Number.isFinite(number) ? Math.min(max, Math.max(min, Math.round(number))) : fallback;
+}
+
+function shouldMuteLiveOriginal(config) {
+  return shouldActivateBufferedPlayer(config);
 }
 
 function createRequestTimeoutSignal(timeoutMs) {

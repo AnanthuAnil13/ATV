@@ -54,6 +54,24 @@
         </select>
       </label>
 
+      <section class="playback-card" aria-label="Playback synchronization">
+        <label>
+          <span>Playback mode</span>
+          <select id="syncMode" aria-label="Playback mode">
+            <option value="live">Live</option>
+            <option value="buffered">Buffered</option>
+          </select>
+          <small id="playbackModeHelp">Live leaves the page video timing unchanged.</small>
+        </label>
+        <label id="initialBufferRow" hidden>
+          <span>Initial buffer</span>
+          <div class="number-row">
+            <input id="initialBufferSeconds" type="number" min="5" max="30" step="1" value="10" aria-label="Initial buffer seconds" />
+            <span>seconds</span>
+          </div>
+        </label>
+      </section>
+
       <aside id="modeNote" class="audio-note" aria-live="polite"></aside>
 
       <section class="mix-card" aria-label="Audio mix">
