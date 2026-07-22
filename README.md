@@ -318,11 +318,13 @@ The browser sends the captured tab-audio track directly to OpenAI over WebRTC. T
 The extension records the captured tab audio into short WebM/Opus segments and posts each segment to the local backend. The backend:
 
 1. converts the segment to 16 kHz mono PCM WAV with ffmpeg
-2. transcribes it with whisper.cpp
+2. transcribes it with whisper.cpp JSON output
 3. translates the transcript using the selected Ollama model
 4. for dub modes, asks Ollama to split the translation into speaker turns
 5. synthesizes each translated turn with a stable Piper voice assigned to that inferred speaker
 6. returns translated text and optional WAV audio clips to the extension
+
+Local Whisper responses include structured speech segments. The backend normalizes each segment's chunk-relative Whisper timing and, when buffered chunk metadata is available, maps those segment times onto the source video timeline using the captured chunk start/end media times. Translation is still whole-chunk: Ollama receives the reconstructed transcript text for the entire chunk. Subtitle cue scheduling, segment-level translation alignment, and exact synchronized display are not implemented yet; those will be added in a later step.
 
 The backend stores only a small in-memory rolling text context for the active local session. Temporary audio and transcript files are deleted after each request.
 

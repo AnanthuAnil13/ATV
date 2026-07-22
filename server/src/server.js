@@ -18,6 +18,13 @@ import {
   OLLAMA_TARGET_LANGUAGE_CODES,
   OPENAI_TARGET_LANGUAGE_CODES
 } from "./languages.js";
+import {
+  WHISPER_JSON_INVALID,
+  WHISPER_JSON_SCHEMA_UNSUPPORTED,
+  buildChunkTimingResponseFields,
+  buildTranscriptionFromWhisperJson,
+  buildTranscriptSegmentResponse
+} from "./whisperSegments.js";
 
 dotenv.config();
 
@@ -234,15 +241,20 @@ app.post(
       await writeFile(inputPath, req.body);
 
       await convertToWhisperWav(inputPath, wavPath);
-      const sourceText = await transcribeWithWhisper(wavPath, sourceLanguage, tempDir);
+      const transcription = await transcribeWithWhisper(wavPath, sourceLanguage, tempDir);
+      const sourceText = transcription.text;
+      const transcriptSegments = buildTranscriptSegmentResponse({
+        segments: transcription.segments,
+        metadata: chunkMetadata,
+        showSourceTranscript
+      });
+      const chunkTiming = buildChunkTimingResponseFields(chunkMetadata);
       if (!sourceText) {
         return res.json({
           ok: true,
           empty: true,
-          sequence: chunkMetadata?.sequence,
-          generation: chunkMetadata?.generation,
-          chunkStartMs: chunkMetadata?.videoStartMs,
-          chunkEndMs: chunkMetadata?.videoEndMs
+          ...chunkTiming,
+          transcriptSegments: []
         });
       }
 
@@ -270,11 +282,9 @@ app.post(
         return res.json({
           ok: true,
           empty: true,
-          sequence: chunkMetadata?.sequence,
-          generation: chunkMetadata?.generation,
-          chunkStartMs: chunkMetadata?.videoStartMs,
-          chunkEndMs: chunkMetadata?.videoEndMs,
-          sourceText: showSourceTranscript ? sourceText : undefined
+          ...chunkTiming,
+          sourceText: showSourceTranscript ? sourceText : undefined,
+          transcriptSegments
         });
       }
 
@@ -305,12 +315,10 @@ app.post(
       updateLocalContext(sessionId, sourceText, translatedText, translation.turns);
       return res.json({
         ok: true,
-        sequence: chunkMetadata?.sequence,
-        generation: chunkMetadata?.generation,
-        chunkStartMs: chunkMetadata?.videoStartMs,
-        chunkEndMs: chunkMetadata?.videoEndMs,
+        ...chunkTiming,
         sourceText: showSourceTranscript ? sourceText : undefined,
         translatedText,
+        transcriptSegments,
         turns: translation.turns,
         dubClips,
         audioBase64,
@@ -432,7 +440,7 @@ async function convertToWhisperWav(inputPath, wavPath) {
 
 async function transcribeWithWhisper(wavPath, sourceLanguage, tempDir) {
   const outputPrefix = path.join(tempDir, "transcript");
-  const { stdout } = await runCommand(whisperCommand, [
+  await runCommand(whisperCommand, [
     ...whisperExtraArgs,
     "-m",
     whisperModelPath,
@@ -440,19 +448,44 @@ async function transcribeWithWhisper(wavPath, sourceLanguage, tempDir) {
     wavPath,
     "-l",
     sourceLanguage,
-    "-nt",
-    "-otxt",
+    "-oj",
     "-of",
     outputPrefix
   ]);
 
-  let text = "";
+  let jsonText = "";
   try {
-    text = await readFile(`${outputPrefix}.txt`, "utf8");
+    jsonText = await readFile(`${outputPrefix}.json`, "utf8");
   } catch {
-    text = stdout;
+    throw createHttpError(
+      502,
+      "whisper.cpp did not produce the expected JSON transcript.",
+      "WHISPER_JSON_OUTPUT_MISSING",
+      true
+    );
   }
-  return cleanTranscript(text);
+
+  try {
+    return buildTranscriptionFromWhisperJson(jsonText);
+  } catch (error) {
+    if (error.code === WHISPER_JSON_INVALID) {
+      throw createHttpError(
+        502,
+        "whisper.cpp produced invalid JSON transcript output.",
+        WHISPER_JSON_INVALID,
+        true
+      );
+    }
+    if (error.code === WHISPER_JSON_SCHEMA_UNSUPPORTED) {
+      throw createHttpError(
+        502,
+        "whisper.cpp JSON transcript schema is unsupported.",
+        WHISPER_JSON_SCHEMA_UNSUPPORTED,
+        true
+      );
+    }
+    throw error;
+  }
 }
 
 async function translateWithOllama({ model, sourceLanguage, targetLanguage, sourceText, sessionId }) {
