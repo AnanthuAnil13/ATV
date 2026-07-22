@@ -3,10 +3,11 @@
   window.__autoTranslateBufferedPlayerInstalled = true;
 
   const core = window.AutoTranslateBufferedPlayerCore;
+  const timeline = window.AutoTranslateMediaTimeline;
   const SEGMENT_TIMESLICE_MS = 1000;
   const QUOTA_RETAIN_SECONDS = 5;
   const ROUTINE_RETAIN_SECONDS = 30;
-  const SEEK_JUMP_TOLERANCE_SECONDS = 2.5;
+  const SEEK_JUMP_TOLERANCE_MS = 2500;
 
   let controller = null;
 
@@ -30,6 +31,20 @@
       return false;
     }
 
+    if (message?.type === "BUFFERED_TIMELINE_SNAPSHOT_REQUEST") {
+      try {
+        const snapshot = controller?.timelineSnapshot("snapshot");
+        if (!snapshot) throw new Error("Timeline snapshot unavailable.");
+        if (message.payload?.bufferedSessionId && snapshot.sessionId !== message.payload.bufferedSessionId) {
+          throw new Error("Buffered session ID mismatch.");
+        }
+        sendResponse({ ok: true, snapshot });
+      } catch (error) {
+        sendResponse({ ok: false, error: sanitizeMediaError(error) });
+      }
+      return false;
+    }
+
     return false;
   });
 
@@ -38,8 +53,14 @@
     if (!core) {
       throw new Error("The buffered player helper module was not loaded.");
     }
+    if (!timeline) {
+      throw new Error("The buffered timeline helper module was not loaded.");
+    }
     if (!core.shouldActivateBufferedPlayer(config)) {
       throw new Error("Buffered playback is only available for local Ollama buffered mode.");
+    }
+    if (!config.bufferedSessionId) {
+      throw new Error("Missing buffered playback session ID.");
     }
 
     const nextController = createController(config);
@@ -68,6 +89,15 @@
         initialBufferSeconds: core.clampInitialBufferSeconds(rawConfig.initialBufferSeconds),
         originalVolume: clampVolume(rawConfig.originalVolume)
       },
+      bufferedSessionId: String(rawConfig.bufferedSessionId || ""),
+      generation: 0,
+      seekCycle: {
+        generation: 0,
+        seekInProgress: false,
+        seekStartedAtEpochMs: null,
+        lastCompletedAtEpochMs: null
+      },
+      pipelineEpoch: 0,
       phase: "idle",
       stopped: false,
       sourceVideo: null,
@@ -96,6 +126,7 @@
       healthTimer: null,
       lastSourceTime: null,
       lastSourceTimeStamp: null,
+      lastTimelineSnapshot: null,
       lastReportedStatus: "",
       lastReportedAt: 0,
       bufferedSeconds: 0
@@ -104,7 +135,8 @@
     return {
       start,
       stop,
-      publicStatus
+      publicStatus,
+      timelineSnapshot
     };
 
     async function start() {
@@ -119,11 +151,9 @@
       installPlacementObservers();
       installSourceEventListeners();
 
-      state.captureStream = captureSourceMedia(state.sourceVideo);
-      validateCapturedStream(state.sourceVideo, state.captureStream);
       state.recorderMimeType = pickRecorderMimeType();
-      setupMediaSource(state.recorderMimeType);
-      setupRecorder(state.recorderMimeType);
+      setupFreshPipeline("initial-buffer");
+      emitTimelineEvent("loadedmetadata");
       reportStatus("buffering");
       updateBufferingOverlay();
     }
@@ -149,41 +179,8 @@
       try { state.resizeObserver?.disconnect(); } catch {}
       state.resizeObserver = null;
 
-      try {
-        if (state.recorder && state.recorder.state !== "inactive") {
-          state.recorder.stop();
-        }
-      } catch {}
-      state.recorder = null;
-
-      try {
-        state.captureStream?.getTracks().forEach((track) => track.stop());
-      } catch {}
-      state.captureStream = null;
-
-      try {
-        if (state.sourceBuffer && state.mediaSource?.readyState === "open") {
-          if (state.sourceBuffer.updating) state.sourceBuffer.abort();
-        }
-      } catch {}
-      state.sourceBuffer = null;
-
-      try {
-        if (state.delayedVideo) {
-          state.delayedVideo.pause();
-          state.delayedVideo.removeAttribute("src");
-          state.delayedVideo.srcObject = null;
-          state.delayedVideo.load();
-        }
-      } catch {}
-      state.delayedVideo = null;
-
-      if (state.mediaSourceUrl) {
-        try { URL.revokeObjectURL(state.mediaSourceUrl); } catch {}
-        state.mediaSourceUrl = null;
-      }
-      state.mediaSource = null;
-      state.segmentQueue.clear();
+      state.pipelineEpoch += 1;
+      teardownMediaPipeline({ keepVideoElement: false });
 
       restoreSourceVideo();
       if (removeRoot) {
@@ -198,11 +195,41 @@
       return {
         status: state.phase,
         tabId: state.config.tabId,
+        bufferedSessionId: state.bufferedSessionId,
+        generation: state.generation,
         bufferedSeconds: state.bufferedSeconds,
         currentTime: state.delayedVideo?.currentTime,
         sourceTime: state.sourceVideo?.currentTime,
         sequence: state.lastAppendedSequence
       };
+    }
+
+    function timelineSnapshot(eventType = "snapshot") {
+      const snapshot = timeline.createTimelineSnapshotFromVideo(state.sourceVideo, {
+        sessionId: state.bufferedSessionId,
+        generation: state.generation,
+        eventType
+      });
+      state.lastTimelineSnapshot = snapshot;
+      return snapshot;
+    }
+
+    function emitTimelineEvent(eventType) {
+      let snapshot;
+      try {
+        snapshot = timelineSnapshot(eventType);
+      } catch (error) {
+        fail(error);
+        return null;
+      }
+      chrome.runtime.sendMessage({
+        type: "BUFFERED_TIMELINE_EVENT",
+        payload: {
+          tabId: state.config.tabId,
+          ...snapshot
+        }
+      }).catch(() => null);
+      return snapshot;
     }
 
     function buildDelayedPlayer() {
@@ -268,7 +295,29 @@
       placePlayer();
     }
 
-    function setupMediaSource(mimeType) {
+    function setupFreshPipeline(reason) {
+      const epoch = state.pipelineEpoch + 1;
+      state.pipelineEpoch = epoch;
+      teardownMediaPipeline({ keepVideoElement: true });
+      state.recorderEnded = false;
+      state.segmentQueue = core.createSegmentQueue(0);
+      state.nextSegmentSequence = 0;
+      state.lastAppendedSequence = -1;
+      state.appending = false;
+      state.delayedPlaybackStarted = false;
+      state.bufferedSeconds = 0;
+      state.captureStream = captureSourceMedia(state.sourceVideo);
+      validateCapturedStream(state.sourceVideo, state.captureStream);
+      setupMediaSource(state.recorderMimeType, epoch);
+      setupRecorder(state.recorderMimeType, epoch);
+      console.debug("[AutoTranslate buffered player] pipeline reset", {
+        reason,
+        generation: state.generation,
+        epoch
+      });
+    }
+
+    function setupMediaSource(mimeType, epoch) {
       if (typeof MediaSource === "undefined") {
         throw new Error("MediaSource is not available in this browser for buffered playback.");
       }
@@ -278,18 +327,22 @@
       state.delayedVideo.src = state.mediaSourceUrl;
 
       addListener(state.mediaSource, "sourceopen", () => {
-        if (state.stopped || state.sourceBuffer) return;
+        if (state.stopped || !timeline.isCurrentPipelineEpoch(epoch, state.pipelineEpoch) || state.sourceBuffer) return;
         try {
           state.sourceBuffer = state.mediaSource.addSourceBuffer(mimeType);
           try { state.sourceBuffer.mode = "sequence"; } catch {}
-          addListener(state.sourceBuffer, "updateend", onSourceBufferUpdateEnd);
+          addListener(state.sourceBuffer, "updateend", () => onSourceBufferUpdateEnd(epoch));
           addListener(state.sourceBuffer, "error", () => {
-            fail(new Error("SourceBuffer append failed during buffered playback."));
+            if (timeline.isCurrentPipelineEpoch(epoch, state.pipelineEpoch)) {
+              fail(new Error("SourceBuffer append failed during buffered playback."));
+            }
           });
           addListener(state.sourceBuffer, "abort", () => {
-            if (!state.stopped) fail(new Error("SourceBuffer append was aborted during buffered playback."));
+            if (!state.stopped && timeline.isCurrentPipelineEpoch(epoch, state.pipelineEpoch)) {
+              fail(new Error("SourceBuffer append was aborted during buffered playback."));
+            }
           });
-          drainAppendQueue();
+          drainAppendQueue(epoch);
         } catch (error) {
           fail(new Error(`MediaSource could not create a SourceBuffer for ${mimeType}.`));
         }
@@ -300,7 +353,7 @@
       });
     }
 
-    function setupRecorder(mimeType) {
+    function setupRecorder(mimeType, epoch) {
       if (typeof MediaRecorder === "undefined") {
         throw new Error("MediaRecorder is not available in this browser for buffered playback.");
       }
@@ -316,7 +369,7 @@
       }
 
       addListener(state.recorder, "dataavailable", (event) => {
-        if (state.stopped || !event.data?.size) return;
+        if (state.stopped || !timeline.isCurrentPipelineEpoch(epoch, state.pipelineEpoch) || !event.data?.size) return;
         const sequence = state.nextSegmentSequence++;
         const segment = { sequence, blob: event.data, size: event.data.size };
         try {
@@ -324,19 +377,23 @@
           console.debug("[AutoTranslate buffered player] segment", {
             sequence,
             size: event.data.size,
+            generation: state.generation,
             mimeType: event.data.type || state.recorderMimeType
           });
-          drainAppendQueue();
+          drainAppendQueue(epoch);
         } catch (error) {
           fail(error);
         }
       });
 
       addListener(state.recorder, "error", (event) => {
-        fail(event.error || new Error("The delayed video recorder failed."));
+        if (timeline.isCurrentPipelineEpoch(epoch, state.pipelineEpoch)) {
+          fail(event.error || new Error("The delayed video recorder failed."));
+        }
       });
 
       addListener(state.recorder, "stop", () => {
+        if (!timeline.isCurrentPipelineEpoch(epoch, state.pipelineEpoch)) return;
         state.recorderEnded = true;
         maybeEndMediaSource();
       });
@@ -350,8 +407,46 @@
       console.debug("[AutoTranslate buffered player] recorder started", { mimeType });
     }
 
-    function drainAppendQueue() {
-      if (state.stopped || state.appending || !state.sourceBuffer || state.sourceBuffer.updating) return;
+    function teardownMediaPipeline({ keepVideoElement }) {
+      try {
+        if (state.recorder && state.recorder.state !== "inactive") state.recorder.stop();
+      } catch {}
+      state.recorder = null;
+      try {
+        state.captureStream?.getTracks().forEach((track) => track.stop());
+      } catch {}
+      state.captureStream = null;
+      try {
+        if (state.sourceBuffer && state.mediaSource?.readyState === "open" && state.sourceBuffer.updating) {
+          state.sourceBuffer.abort();
+        }
+      } catch {}
+      state.sourceBuffer = null;
+      state.appending = false;
+      state.segmentQueue.clear();
+      try {
+        if (state.delayedVideo) {
+          state.delayedVideo.pause();
+          state.delayedVideo.removeAttribute("src");
+          state.delayedVideo.load();
+        }
+      } catch {}
+      if (state.mediaSourceUrl) {
+        try { URL.revokeObjectURL(state.mediaSourceUrl); } catch {}
+        state.mediaSourceUrl = null;
+      }
+      state.mediaSource = null;
+      if (!keepVideoElement) state.delayedVideo = null;
+    }
+
+    function drainAppendQueue(epoch) {
+      if (
+        state.stopped ||
+        !timeline.isCurrentPipelineEpoch(epoch, state.pipelineEpoch) ||
+        state.appending ||
+        !state.sourceBuffer ||
+        state.sourceBuffer.updating
+      ) return;
       const segment = state.segmentQueue.peek();
       if (!segment) {
         maybeEndMediaSource();
@@ -361,7 +456,7 @@
       state.appending = true;
       segment.blob.arrayBuffer()
         .then((buffer) => {
-          if (state.stopped || !state.sourceBuffer) return;
+          if (state.stopped || !timeline.isCurrentPipelineEpoch(epoch, state.pipelineEpoch) || !state.sourceBuffer) return;
           try {
             state.sourceBuffer.appendBuffer(buffer);
             state.segmentQueue.shift();
@@ -373,17 +468,19 @@
           }
         })
         .catch((error) => {
+          if (!timeline.isCurrentPipelineEpoch(epoch, state.pipelineEpoch)) return;
           state.appending = false;
           fail(new Error("The buffered media segment could not be read for appending."));
         });
     }
 
-    function onSourceBufferUpdateEnd() {
+    function onSourceBufferUpdateEnd(epoch) {
+      if (!timeline.isCurrentPipelineEpoch(epoch, state.pipelineEpoch)) return;
       state.appending = false;
       updateBufferedReadiness();
       if (!evictOldBufferedMedia(ROUTINE_RETAIN_SECONDS)) {
         maybeEndMediaSource();
-        drainAppendQueue();
+        drainAppendQueue(epoch);
       }
     }
 
@@ -415,7 +512,7 @@
       if (!state.delayedPlaybackStarted && (ready || (state.sourceEnded && state.bufferedSeconds > 0))) {
         playDelayedVideo();
       } else if (!state.delayedPlaybackStarted) {
-        reportStatus("buffering");
+        reportStatus(state.phase === "rebuffering" ? "rebuffering" : "buffering");
       }
     }
 
@@ -443,6 +540,7 @@
         if (state.stopped || source.ended || source.seeking) return;
         state.sourcePaused = true;
         state.phase = core.reducePlayerLifecycle(state.phase, "PAUSE");
+        emitTimelineEvent("pause");
         try {
           if (state.recorder?.state === "recording") state.recorder.pause();
         } catch {}
@@ -457,23 +555,23 @@
       addListener(source, "ended", () => {
         if (state.stopped) return;
         state.sourceEnded = true;
+        emitTimelineEvent("ended");
         try {
           if (state.recorder && state.recorder.state !== "inactive") state.recorder.stop();
         } catch {}
         updateBufferedReadiness();
       });
 
-      addListener(source, "seeking", () => {
-        if (!state.stopped) {
-          fail(new Error("The source video was seeked. Restart translation to use buffered playback after a seek."), {
-            title: "Restart required after seek"
-          });
-        }
-      });
+      addListener(source, "seeking", handleSourceSeeking);
+      addListener(source, "seeked", handleSourceSeeked);
 
       addListener(source, "ratechange", () => {
         if (state.delayedVideo) state.delayedVideo.playbackRate = source.playbackRate || 1;
+        emitTimelineEvent("ratechange");
       });
+
+      addListener(source, "loadedmetadata", () => emitTimelineEvent("loadedmetadata"));
+      addListener(source, "emptied", () => emitTimelineEvent("emptied"));
 
       addListener(source, "timeupdate", () => {
         detectSourceSeekByJump();
@@ -488,9 +586,64 @@
       }, 1000);
     }
 
+    function handleSourceSeeking() {
+      if (state.stopped) return;
+      state.seekCycle = timeline.applySeekCycleEvent(state.seekCycle, {
+        eventType: "seeking"
+      });
+      state.sourcePaused = true;
+      state.phase = "rebuffering";
+      try { state.delayedVideo?.pause(); } catch {}
+      state.pipelineEpoch += 1;
+      teardownMediaPipeline({ keepVideoElement: true });
+      emitTimelineEvent("seeking");
+      reportStatus("rebuffering");
+      updateBufferingOverlay("Rebuffering after seek", "Waiting for the source video timeline to settle.");
+    }
+
+    function handleSourceSeeked() {
+      if (state.stopped) return;
+      completeTimelineRecovery("seeked");
+    }
+
+    function completeTimelineRecovery(eventType) {
+      const previousGeneration = state.generation;
+      const nextSeekCycle = timeline.applySeekCycleEvent(state.seekCycle, {
+        eventType
+      });
+      state.seekCycle = nextSeekCycle;
+      state.generation = state.seekCycle.generation;
+      if (!nextSeekCycle.changed) {
+        emitTimelineEvent(eventType);
+        return;
+      }
+
+      state.sourcePaused = state.sourceVideo.paused;
+      state.sourceEnded = state.sourceVideo.ended;
+      state.phase = "rebuffering";
+      state.lastSourceTime = state.sourceVideo.currentTime;
+      state.lastSourceTimeStamp = performance.now();
+      emitTimelineEvent(eventType);
+      reportStatus("rebuffering");
+      updateBufferingOverlay("Rebuffering delayed playback", "Captured media before the seek was discarded.");
+
+      try {
+        setupFreshPipeline(eventType);
+      } catch (error) {
+        fail(new Error("Buffered playback could not rebuild the delayed media pipeline after the seek."));
+        return;
+      }
+
+      if (!state.sourceVideo.paused && !state.sourceVideo.ended) {
+        updateBufferedReadiness();
+      }
+    }
+
     function handleSourceResume() {
       if (state.stopped || state.sourceVideo.seeking) return;
       state.sourcePaused = false;
+      state.sourceEnded = false;
+      emitTimelineEvent(state.sourceVideo.paused ? "play" : "playing");
       state.phase = core.reducePlayerLifecycle(state.phase, "RESUME");
       try {
         if (state.recorder?.state === "paused") state.recorder.resume();
@@ -510,25 +663,32 @@
     }
 
     function detectSourceSeekByJump() {
-      const source = state.sourceVideo;
-      const now = performance.now();
-      const currentTime = source.currentTime;
-      if (state.lastSourceTime === null) {
-        state.lastSourceTime = currentTime;
-        state.lastSourceTimeStamp = now;
+      if (state.sourceVideo.paused || state.sourceVideo.seeking || state.sourcePaused) return;
+      let currentSnapshot;
+      try {
+        currentSnapshot = timeline.createTimelineSnapshotFromVideo(state.sourceVideo, {
+          sessionId: state.bufferedSessionId,
+          generation: state.generation,
+          eventType: "timeupdate"
+        });
+      } catch {
         return;
       }
 
-      const elapsedSeconds = Math.max(0, (now - state.lastSourceTimeStamp) / 1000);
-      const expectedDelta = elapsedSeconds * (source.playbackRate || 1);
-      const actualDelta = currentTime - state.lastSourceTime;
-      state.lastSourceTime = currentTime;
-      state.lastSourceTimeStamp = now;
-
-      if (!source.paused && Math.abs(actualDelta - expectedDelta) > SEEK_JUMP_TOLERANCE_SECONDS) {
-        fail(new Error("The source video timeline jumped. Restart translation to use buffered playback after a seek."), {
-          title: "Restart required after seek"
+      const previousSnapshot = state.lastTimelineSnapshot;
+      state.lastTimelineSnapshot = currentSnapshot;
+      state.lastSourceTime = state.sourceVideo.currentTime;
+      state.lastSourceTimeStamp = performance.now();
+      const jump = timeline.detectTimelineJump(previousSnapshot, currentSnapshot, {
+        toleranceMs: SEEK_JUMP_TOLERANCE_MS
+      });
+      if (jump.jumped) {
+        console.debug("[AutoTranslate buffered player] timeline jump", {
+          generation: state.generation,
+          driftMs: jump.driftMs,
+          playbackRate: currentSnapshot.playbackRate
         });
+        completeTimelineRecovery("timeline-jump");
       }
     }
 
@@ -620,6 +780,8 @@
         payload: {
           status,
           tabId: state.config.tabId,
+          bufferedSessionId: state.bufferedSessionId,
+          generation: state.generation,
           bufferedSeconds: state.bufferedSeconds,
           currentTime: state.delayedVideo?.currentTime,
           sourceTime: state.sourceVideo?.currentTime,

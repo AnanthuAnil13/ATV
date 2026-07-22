@@ -11,6 +11,14 @@ import {
   shouldActivateBufferedPlayer,
   validatePlaybackMode
 } from "../shared/playback-settings.js";
+import "../shared/media-timeline.js";
+import {
+  advanceLocalGeneration,
+  shouldDiscardRecordedChunk,
+  shouldIgnoreBackendResult
+} from "./local-timeline-state.js";
+
+const timeline = globalThis.AutoTranslateMediaTimeline;
 
 let session = null;
 
@@ -40,6 +48,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       .then(() => sendResponse({ ok: true }))
       .catch((error) => sendResponse({ ok: false, error: error.message }));
     return true;
+  }
+
+  if (message.type === "OFFSCREEN_TIMELINE_EVENT") {
+    handleOffscreenTimelineEvent(message.payload).catch(console.error);
+    sendResponse({ ok: true });
+    return false;
   }
 
   return false;
@@ -211,12 +225,20 @@ async function startOllamaLocalSession(currentSession) {
     mimeType,
     chunkMs: clampInteger(currentSession.config.localChunkMs, 2500, 12000, 4500),
     recorder: null,
+    activeRecording: null,
     segmentTimer: null,
+    timelineRetryTimer: null,
     queue: [],
     processing: false,
     startedAt: performance.now(),
     generation: 0,
     sequence: 0,
+    bufferedTimelineEnabled: shouldActivateBufferedPlayer(currentSession.config),
+    bufferedSessionId: currentSession.config.bufferedSessionId || "",
+    paused: false,
+    seeking: false,
+    ended: false,
+    startingRecording: false,
     currentAudio: null,
     audioQueue: [],
     maxAudioQueue: 8,
@@ -234,6 +256,20 @@ async function startOllamaLocalSession(currentSession) {
 }
 
 function startNextLocalRecording(currentSession) {
+  if (shouldUseBufferedTimeline(currentSession)) {
+    startNextBufferedLocalRecording(currentSession).catch((error) => {
+      if (isTimelineTemporarilyUnavailable(error)) {
+        scheduleTimelineRecordingRetry(currentSession);
+      } else {
+        failLocalSession(currentSession, error);
+      }
+    });
+    return;
+  }
+  startNextLiveLocalRecording(currentSession);
+}
+
+function startNextLiveLocalRecording(currentSession) {
   if (session !== currentSession || !currentSession.local) return;
   if (currentSession.sourceTrack.readyState !== "live") return;
 
@@ -290,6 +326,126 @@ function startNextLocalRecording(currentSession) {
   }, currentSession.local.chunkMs);
 }
 
+async function startNextBufferedLocalRecording(currentSession) {
+  const local = currentSession.local;
+  if (session !== currentSession || !local || !local.bufferedTimelineEnabled) return;
+  if (local.startingRecording || local.recorder) return;
+  if (local.paused || local.seeking || local.ended) return;
+  if (currentSession.sourceTrack.readyState !== "live") return;
+
+  local.startingRecording = true;
+  let startSnapshot;
+  try {
+    startSnapshot = await requestBufferedTimelineSnapshot(currentSession, "chunk-start");
+  } finally {
+    local.startingRecording = false;
+  }
+  if (session !== currentSession || !currentSession.local) return;
+  if (startSnapshot.paused || startSnapshot.seeking || startSnapshot.ended) {
+    local.paused = startSnapshot.paused;
+    local.seeking = startSnapshot.seeking;
+    local.ended = startSnapshot.ended;
+    return;
+  }
+  applyBufferedTimelineSnapshot(currentSession, startSnapshot);
+
+  const chunks = [];
+  const captureStartEpochMs = Date.now();
+  const sequence = local.sequence++;
+  const generation = local.generation;
+  const recorderOptions = {
+    audioBitsPerSecond: 96_000
+  };
+  if (local.mimeType) {
+    recorderOptions.mimeType = local.mimeType;
+  }
+
+  const recorder = new MediaRecorder(currentSession.sourceStream, recorderOptions);
+  const activeRecording = {
+    recorder,
+    chunks,
+    startSnapshot,
+    captureStartEpochMs,
+    sequence,
+    generation,
+    discardReason: ""
+  };
+  local.recorder = recorder;
+  local.activeRecording = activeRecording;
+
+  recorder.addEventListener("dataavailable", (event) => {
+    if (event.data?.size) chunks.push(event.data);
+  });
+
+  recorder.addEventListener("error", (event) => {
+    failLocalSession(currentSession, event.error || new Error("Local audio recording failed."));
+  });
+
+  recorder.addEventListener("stop", () => {
+    finishBufferedLocalRecording(currentSession, activeRecording, recorder)
+      .catch((error) => failLocalSession(currentSession, error));
+  }, { once: true });
+
+  recorder.start();
+  local.segmentTimer = setTimeout(() => {
+    if (session === currentSession && recorder.state === "recording") recorder.stop();
+  }, local.chunkMs);
+}
+
+async function finishBufferedLocalRecording(currentSession, activeRecording, recorder) {
+  if (session !== currentSession || !currentSession.local) return;
+  const local = currentSession.local;
+  clearTimeout(local.segmentTimer);
+  if (local.activeRecording === activeRecording) local.activeRecording = null;
+  if (local.recorder === recorder) local.recorder = null;
+
+  const captureEndEpochMs = Date.now();
+  const shouldRestart = !local.paused && !local.seeking && !local.ended;
+  let endSnapshot = null;
+  if (!activeRecording.discardReason) {
+    try {
+      endSnapshot = await requestBufferedTimelineSnapshot(currentSession, "chunk-end");
+      applyBufferedTimelineSnapshot(currentSession, endSnapshot);
+    } catch (error) {
+      activeRecording.discardReason = "timeline-snapshot-unavailable";
+    }
+  }
+
+  const discardReason = activeRecording.discardReason || shouldDiscardRecordedChunk({
+    startSnapshot: activeRecording.startSnapshot,
+    endSnapshot,
+    captureStartEpochMs: activeRecording.captureStartEpochMs,
+    captureEndEpochMs,
+    timeline
+  });
+
+  if (shouldRestart) startNextLocalRecording(currentSession);
+  if (discardReason) {
+    logLocalChunkDiagnostic("recorded_audio_chunk_discarded", {
+      reason: discardReason,
+      generation: activeRecording.generation,
+      sequence: activeRecording.sequence,
+      bufferedSessionIdPrefix: local.bufferedSessionId.slice(0, 8)
+    });
+    return;
+  }
+
+  const blob = createFinalizedAudioBlob(activeRecording.chunks, recorder.mimeType || local.mimeType);
+  const metadata = createChunkMetadata({
+    syncMode: "buffered",
+    sequence: activeRecording.sequence,
+    generation: activeRecording.generation,
+    captureStartEpochMs: activeRecording.captureStartEpochMs,
+    captureEndEpochMs,
+    videoStartMs: activeRecording.startSnapshot.sourceTimeMs,
+    videoEndMs: endSnapshot.sourceTimeMs,
+    playbackRate: activeRecording.startSnapshot.playbackRate
+  });
+
+  validateAndEnqueueLocalChunk(currentSession, blob, metadata)
+    .catch((error) => failLocalSession(currentSession, error));
+}
+
 async function validateAndEnqueueLocalChunk(currentSession, blob, metadata) {
   if (!blob.size) return;
   try {
@@ -303,6 +459,109 @@ async function validateAndEnqueueLocalChunk(currentSession, blob, metadata) {
     });
     throw error;
   }
+}
+
+async function handleOffscreenTimelineEvent(payload = {}) {
+  const currentSession = session;
+  if (!currentSession?.local?.bufferedTimelineEnabled) return;
+  const snapshot = timeline.normalizeTimelineSnapshot(payload);
+  if (!snapshot || snapshot.sessionId !== currentSession.local.bufferedSessionId) return;
+  applyBufferedTimelineSnapshot(currentSession, snapshot);
+}
+
+function applyBufferedTimelineSnapshot(currentSession, snapshot) {
+  const local = currentSession.local;
+  if (!local?.bufferedTimelineEnabled || snapshot.sessionId !== local.bufferedSessionId) return;
+
+  const generationChanged = advanceLocalGeneration(local, snapshot.generation);
+  local.paused = snapshot.paused;
+  local.seeking = snapshot.seeking;
+  local.ended = snapshot.ended;
+
+  if (generationChanged) {
+    stopCurrentLocalDub(currentSession);
+    stopActiveBufferedRecording(currentSession, "generation-changed");
+  }
+
+  if (snapshot.eventType === "seeking" || snapshot.eventType === "timeline-jump-start") {
+    local.seeking = true;
+    stopActiveBufferedRecording(currentSession, "seeking");
+  } else if (snapshot.eventType === "pause") {
+    stopActiveBufferedRecording(currentSession, "");
+  } else if (snapshot.eventType === "ratechange") {
+    stopActiveBufferedRecording(currentSession, "playback-rate-changed");
+  }
+
+  if (!local.paused && !local.seeking && !local.ended && !local.recorder && !local.activeRecording) {
+    startNextLocalRecording(currentSession);
+  }
+}
+
+function stopActiveBufferedRecording(currentSession, discardReason) {
+  const local = currentSession.local;
+  const active = local?.activeRecording;
+  const recorder = local?.recorder;
+  if (!active || !recorder) return;
+  if (discardReason) active.discardReason = discardReason;
+  clearTimeout(local.segmentTimer);
+  try {
+    if (recorder.state === "recording" || recorder.state === "paused") recorder.stop();
+  } catch {}
+}
+
+function stopCurrentLocalDub(currentSession) {
+  const local = currentSession.local;
+  if (!local) return;
+  local.audioQueue = [];
+  try {
+    if (local.currentAudio) {
+      local.currentAudio.pause();
+      local.currentAudio.removeAttribute("src");
+      local.currentAudio.remove();
+    }
+  } catch {}
+  local.currentAudio = null;
+  local.audioPlaying = false;
+}
+
+async function requestBufferedTimelineSnapshot(currentSession, eventType) {
+  const local = currentSession.local;
+  const response = await chrome.runtime.sendMessage({
+    type: "OFFSCREEN_TIMELINE_SNAPSHOT_REQUEST",
+    payload: {
+      tabId: currentSession.config.tabId,
+      bufferedSessionId: local.bufferedSessionId,
+      eventType
+    }
+  });
+  if (!response?.ok) {
+    throw new Error(response?.error || "Timeline snapshot unavailable.");
+  }
+  const snapshot = timeline.normalizeTimelineSnapshot(response.snapshot);
+  if (!snapshot) throw new Error("Timeline snapshot unavailable.");
+  if (snapshot.sessionId !== local.bufferedSessionId) {
+    throw new Error("Buffered session ID mismatch.");
+  }
+  if (timeline.isStaleTimelineSnapshot(snapshot, {
+    sessionId: local.bufferedSessionId,
+    generation: local.generation
+  })) {
+    throw new Error("Stale timeline snapshot.");
+  }
+  return snapshot;
+}
+
+function scheduleTimelineRecordingRetry(currentSession) {
+  const local = currentSession.local;
+  if (!local || local.timelineRetryTimer || session !== currentSession) return;
+  local.timelineRetryTimer = setTimeout(() => {
+    if (currentSession.local) currentSession.local.timelineRetryTimer = null;
+    startNextLocalRecording(currentSession);
+  }, 250);
+}
+
+function isTimelineTemporarilyUnavailable(error) {
+  return /timeline snapshot unavailable|stale timeline snapshot|receiving end does not exist|could not establish connection/i.test(error?.message || "");
 }
 
 function enqueueLocalChunk(currentSession, item) {
@@ -326,17 +585,26 @@ async function processLocalQueue(currentSession) {
     while (session === currentSession && local.queue.length) {
       const item = local.queue.shift();
       if (item.metadata.generation !== local.generation) continue;
-      const result = await requestLocalTranslation(currentSession.config, item);
+      let result;
+      try {
+        result = await requestLocalTranslation(currentSession.config, item);
+      } catch (error) {
+        if (item.metadata.generation !== local.generation) continue;
+        throw error;
+      }
       assertCurrentSession(currentSession);
-      if (result.generation !== undefined && result.generation !== item.metadata.generation) continue;
+      if (shouldIgnoreBackendResult(local, item, result)) continue;
       if (result.empty) continue;
 
-      const elapsedMs = Math.round(performance.now() - local.startedAt);
+      const elapsedMs = item.metadata.syncMode === "buffered"
+        ? item.metadata.videoEndMs
+        : Math.round(performance.now() - local.startedAt);
       if (result.sourceText) {
         notifyTranscript({
           tabId: currentSession.config.tabId,
           kind: "source",
           delta: result.sourceText,
+          generation: item.metadata.generation,
           elapsedMs,
           replace: true
         });
@@ -346,6 +614,7 @@ async function processLocalQueue(currentSession) {
           tabId: currentSession.config.tabId,
           kind: "target",
           delta: result.translatedText,
+          generation: item.metadata.generation,
           elapsedMs,
           replace: true
         });
@@ -356,6 +625,7 @@ async function processLocalQueue(currentSession) {
           for (const clip of dubClips) {
             if (clip?.audioBase64) {
               enqueueLocalDub(currentSession, {
+                generation: item.metadata.generation,
                 audioBase64: clip.audioBase64,
                 mimeType: clip.audioMime || "audio/wav",
                 speakerId: clip.speakerId,
@@ -365,6 +635,7 @@ async function processLocalQueue(currentSession) {
           }
         } else if (result.audioBase64) {
           enqueueLocalDub(currentSession, {
+            generation: item.metadata.generation,
             audioBase64: result.audioBase64,
             mimeType: result.audioMime || "audio/wav",
             speakerId: "speaker_1",
@@ -415,6 +686,7 @@ async function requestLocalTranslation(config, item) {
 function enqueueLocalDub(currentSession, clip) {
   const local = currentSession.local;
   if (!local || session !== currentSession) return;
+  if (clip.generation !== undefined && clip.generation !== local.generation) return;
   if (local.audioQueue.length >= local.maxAudioQueue) local.audioQueue.shift();
   local.audioQueue.push(clip);
   playNextLocalDub(currentSession);
@@ -425,6 +697,10 @@ function playNextLocalDub(currentSession) {
   if (!local || local.audioPlaying || session !== currentSession) return;
   const next = local.audioQueue.shift();
   if (!next) return;
+  if (next.generation !== undefined && next.generation !== local.generation) {
+    playNextLocalDub(currentSession);
+    return;
+  }
 
   local.audioPlaying = true;
   const audio = document.createElement("audio");
@@ -565,6 +841,7 @@ async function stopSession({ notify }) {
   session = null;
 
   try { clearTimeout(oldSession.local?.segmentTimer); } catch {}
+  try { clearTimeout(oldSession.local?.timelineRetryTimer); } catch {}
   try {
     if (oldSession.local?.recorder && oldSession.local.recorder.state !== "inactive") {
       oldSession.local.recorder.stop();
@@ -633,6 +910,9 @@ function validateConfig(config) {
   config.syncMode = normalizeSyncMode(config.syncMode);
   config.initialBufferSeconds = clampInitialBufferSeconds(config.initialBufferSeconds);
   validatePlaybackMode(config);
+  if (shouldActivateBufferedPlayer(config) && !config.bufferedSessionId) {
+    throw new Error("Missing buffered playback session ID.");
+  }
 }
 
 function isDubEnabled(outputMode) {
@@ -651,6 +931,11 @@ function clampInteger(value, min, max, fallback) {
 
 function shouldMuteLiveOriginal(config) {
   return shouldActivateBufferedPlayer(config);
+}
+
+function shouldUseBufferedTimeline(currentSession) {
+  return currentSession.config.provider === "ollama" &&
+    currentSession.local?.bufferedTimelineEnabled === true;
 }
 
 function createRequestTimeoutSignal(timeoutMs) {

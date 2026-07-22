@@ -4,6 +4,9 @@ import {
   shouldActivateBufferedPlayer,
   validatePlaybackMode
 } from "./shared/playback-settings.js";
+import "./shared/media-timeline.js";
+
+const timeline = globalThis.AutoTranslateMediaTimeline;
 
 const OFFSCREEN_DOCUMENT_PATH = "offscreen/offscreen.html";
 const DEFAULT_SETTINGS = {
@@ -93,6 +96,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return false;
   }
 
+  // Buffered timeline bridge:
+  // offscreen -> service worker -> buffered-player content script -> service worker -> offscreen.
+  if (message.type === "OFFSCREEN_TIMELINE_SNAPSHOT_REQUEST") {
+    handleTimelineSnapshotRequest(message.payload)
+      .then((result) => sendResponse({ ok: true, ...result }))
+      .catch((error) => sendResponse({ ok: false, error: sanitizeError(error.message) || "Timeline snapshot unavailable." }));
+    return true;
+  }
+
+  if (message.type === "BUFFERED_TIMELINE_EVENT") {
+    handleBufferedTimelineEvent(message.payload, sender).catch(console.error);
+    return false;
+  }
+
   return false;
 });
 
@@ -134,6 +151,7 @@ async function startTranslation(payload = {}) {
   const dubEnabled = settings.outputMode !== "subtitles";
   const showSourceTranscript = subtitlesEnabled && Boolean(settings.showSourceTranscript);
   const bufferedPlayerEnabled = shouldActivateBufferedPlayer(settings);
+  const bufferedSessionId = bufferedPlayerEnabled ? crypto.randomUUID() : null;
 
   await setSessionState({
     status: "starting",
@@ -146,6 +164,8 @@ async function startTranslation(payload = {}) {
     syncMode: settings.syncMode,
     initialBufferSeconds: settings.initialBufferSeconds,
     bufferedPlayerEnabled,
+    bufferedSessionId,
+    generation: 0,
     bufferedPlayer: bufferedPlayerEnabled ? { status: "idle" } : null,
     subtitlesEnabled,
     dubEnabled,
@@ -187,6 +207,7 @@ async function startTranslation(payload = {}) {
       outputMode: settings.outputMode,
       syncMode: settings.syncMode,
       initialBufferSeconds: settings.initialBufferSeconds,
+      bufferedSessionId,
       originalVolume: settings.originalVolume,
       dubVolume: settings.dubVolume,
       showSourceTranscript,
@@ -207,6 +228,7 @@ async function startTranslation(payload = {}) {
         tabId: tab.id,
         provider: settings.provider,
         syncMode: settings.syncMode,
+        bufferedSessionId,
         initialBufferSeconds: settings.initialBufferSeconds,
         originalVolume: settings.originalVolume,
         outputMode: settings.outputMode
@@ -330,7 +352,7 @@ async function injectBufferedPlayer(tabId, payload) {
 
   await chrome.scripting.executeScript({
     target: { tabId },
-    files: ["content/buffered-player-core.js", "content/buffered-player.js"]
+    files: ["shared/media-timeline.js", "content/buffered-player-core.js", "content/buffered-player.js"]
   });
 
   const response = await chrome.tabs.sendMessage(tabId, {
@@ -350,10 +372,58 @@ async function stopBufferedPlayer(tabId) {
   }).catch(() => null);
 }
 
+async function handleTimelineSnapshotRequest(payload = {}) {
+  const { translationState } = await chrome.storage.session.get("translationState");
+  const tabId = payload.tabId ?? translationState?.tabId ?? null;
+  const bufferedSessionId = payload.bufferedSessionId ?? translationState?.bufferedSessionId;
+  validateBufferedTimelineTarget(translationState, tabId, bufferedSessionId);
+
+  const response = await chrome.tabs.sendMessage(tabId, {
+    type: "BUFFERED_TIMELINE_SNAPSHOT_REQUEST",
+    payload: { bufferedSessionId }
+  }).catch(() => null);
+  if (!response?.ok) {
+    throw new Error(response?.error || "Timeline snapshot unavailable.");
+  }
+
+  const snapshot = timeline.normalizeTimelineSnapshot(response.snapshot);
+  if (!snapshot) throw new Error("Timeline snapshot unavailable.");
+  validateBufferedTimelineTarget(translationState, tabId, snapshot.sessionId);
+  return { snapshot };
+}
+
+async function handleBufferedTimelineEvent(payload = {}, sender = {}) {
+  const { translationState } = await chrome.storage.session.get("translationState");
+  const tabId = sender.tab?.id ?? payload.tabId ?? null;
+  const snapshot = timeline.normalizeTimelineSnapshot(payload);
+  if (!snapshot) return;
+  if (!isBufferedTimelineTarget(translationState, tabId, snapshot.sessionId)) return;
+
+  const statePatch = {
+    tabId,
+    bufferedSessionId: snapshot.sessionId,
+    generation: snapshot.generation,
+    sourceTimeMs: snapshot.sourceTimeMs,
+    playbackRate: snapshot.playbackRate,
+    paused: snapshot.paused,
+    seeking: snapshot.seeking,
+    ended: snapshot.ended
+  };
+  if (snapshot.durationMs !== undefined) statePatch.durationMs = snapshot.durationMs;
+
+  await setSessionState(statePatch);
+  await chrome.runtime.sendMessage({
+    type: "OFFSCREEN_TIMELINE_EVENT",
+    target: "offscreen",
+    payload: snapshot
+  }).catch(() => null);
+}
+
 async function handleBufferedPlayerStatus(payload = {}) {
   const { translationState } = await chrome.storage.session.get("translationState");
   const tabId = payload.tabId ?? translationState?.tabId ?? null;
   if (!tabId || translationState?.tabId !== tabId || !translationState?.bufferedPlayerEnabled) return;
+  if (payload.bufferedSessionId && payload.bufferedSessionId !== translationState.bufferedSessionId) return;
 
   const bufferedPlayer = sanitizeBufferedPlayerStatus(payload);
   if (bufferedPlayer.status === "error") {
@@ -371,6 +441,8 @@ async function handleBufferedPlayerStatus(payload = {}) {
       provider: translationState.provider,
       outputMode: translationState.outputMode,
       syncMode: translationState.syncMode,
+      bufferedSessionId: translationState.bufferedSessionId,
+      generation: bufferedPlayer.generation ?? translationState.generation,
       initialBufferSeconds: translationState.initialBufferSeconds,
       bufferedPlayer,
       error: bufferedPlayer.error || "The buffered video player failed."
@@ -381,8 +453,30 @@ async function handleBufferedPlayerStatus(payload = {}) {
   await setSessionState({
     status: translationState.status || "connected",
     tabId,
+    generation: bufferedPlayer.generation ?? translationState.generation,
     bufferedPlayer
   });
+}
+
+function validateBufferedTimelineTarget(translationState, tabId, bufferedSessionId) {
+  if (!translationState?.bufferedPlayerEnabled || translationState.syncMode !== "buffered") {
+    throw new Error("Buffered timeline is not active.");
+  }
+  if (!tabId || translationState.tabId !== tabId) {
+    throw new Error("Buffered timeline tab mismatch.");
+  }
+  if (!bufferedSessionId || translationState.bufferedSessionId !== bufferedSessionId) {
+    throw new Error("Buffered timeline session mismatch.");
+  }
+}
+
+function isBufferedTimelineTarget(translationState, tabId, bufferedSessionId) {
+  try {
+    validateBufferedTimelineTarget(translationState, tabId, bufferedSessionId);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function setSessionState(patch) {
@@ -419,11 +513,13 @@ function clampVolume(value) {
 }
 
 function sanitizeBufferedPlayerStatus(payload = {}) {
-  const allowedStatus = new Set(["buffering", "playing", "paused", "ended", "error", "stopped"]);
+  const allowedStatus = new Set(["buffering", "rebuffering", "playing", "paused", "ended", "error", "stopped"]);
   const status = allowedStatus.has(payload.status) ? payload.status : "buffering";
   return {
     status,
     error: sanitizeError(payload.error),
+    bufferedSessionId: sanitizeSessionId(payload.bufferedSessionId),
+    generation: sanitizeInteger(payload.generation),
     bufferedSeconds: sanitizeNumber(payload.bufferedSeconds),
     currentTime: sanitizeNumber(payload.currentTime),
     sourceTime: sanitizeNumber(payload.sourceTime),
@@ -440,4 +536,13 @@ function sanitizeError(value) {
 function sanitizeNumber(value) {
   const number = Number(value);
   return Number.isFinite(number) ? number : undefined;
+}
+
+function sanitizeInteger(value) {
+  const number = Number(value);
+  return Number.isInteger(number) && number >= 0 ? number : undefined;
+}
+
+function sanitizeSessionId(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
