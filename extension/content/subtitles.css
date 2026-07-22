@@ -56,6 +56,13 @@
   background: rgba(25, 180, 105, 0.3);
 }
 
+#autotranslate-overlay .autotranslate-status[data-status="playing"],
+#autotranslate-overlay .autotranslate-status[data-status="buffering"],
+#autotranslate-overlay .autotranslate-status[data-status="rebuffering"],
+#autotranslate-overlay .autotranslate-status[data-status="paused"] {
+  background: rgba(25, 180, 105, 0.3);
+}
+
 #autotranslate-overlay .autotranslate-status[data-status="error"] {
   background: rgba(220, 55, 70, 0.42);
 }
@@ -88,6 +95,7 @@
   -webkit-box-decoration-break: clone;
   text-shadow: 0 2px 4px rgba(0, 0, 0, 0.85);
   overflow-wrap: anywhere;
+  white-space: pre-line;
 }
 
 #autotranslate-overlay .autotranslate-source {

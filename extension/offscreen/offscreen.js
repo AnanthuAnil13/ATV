@@ -599,25 +599,38 @@ async function processLocalQueue(currentSession) {
       const elapsedMs = item.metadata.syncMode === "buffered"
         ? item.metadata.videoEndMs
         : Math.round(performance.now() - local.startedAt);
-      if (result.sourceText) {
-        notifyTranscript({
-          tabId: currentSession.config.tabId,
-          kind: "source",
-          delta: result.sourceText,
-          generation: item.metadata.generation,
-          elapsedMs,
-          replace: true
-        });
-      }
-      if (result.translatedText) {
-        notifyTranscript({
-          tabId: currentSession.config.tabId,
-          kind: "target",
-          delta: result.translatedText,
-          generation: item.metadata.generation,
-          elapsedMs,
-          replace: true
-        });
+      if (shouldUseBufferedSubtitleSegments(currentSession.config)) {
+        const translatedSegments = normalizeBufferedSubtitleSegments(result, item, currentSession);
+        if (translatedSegments.length) {
+          notifyBufferedSubtitleSegments({
+            tabId: currentSession.config.tabId,
+            bufferedSessionId: local.bufferedSessionId,
+            generation: item.metadata.generation,
+            sequence: item.metadata.sequence,
+            translatedSegments
+          });
+        }
+      } else {
+        if (result.sourceText) {
+          notifyTranscript({
+            tabId: currentSession.config.tabId,
+            kind: "source",
+            delta: result.sourceText,
+            generation: item.metadata.generation,
+            elapsedMs,
+            replace: true
+          });
+        }
+        if (result.translatedText) {
+          notifyTranscript({
+            tabId: currentSession.config.tabId,
+            kind: "target",
+            delta: result.translatedText,
+            generation: item.metadata.generation,
+            elapsedMs,
+            replace: true
+          });
+        }
       }
       if (isDubEnabled(currentSession.config.outputMode)) {
         const dubClips = Array.isArray(result.dubClips) ? result.dubClips : [];
@@ -885,6 +898,66 @@ function notifyTranscript(payload) {
     type: "OFFSCREEN_TRANSCRIPT",
     payload
   }).catch(() => null);
+}
+
+function notifyBufferedSubtitleSegments(payload) {
+  chrome.runtime.sendMessage({
+    type: "OFFSCREEN_BUFFERED_SUBTITLE_SEGMENTS",
+    payload
+  }).catch(() => null);
+}
+
+function shouldUseBufferedSubtitleSegments(config) {
+  return config?.provider === "ollama" &&
+    config?.syncMode === "buffered" &&
+    (config?.outputMode === "subtitles" || config?.outputMode === "both");
+}
+
+function normalizeBufferedSubtitleSegments(result, item, currentSession) {
+  const local = currentSession.local;
+  if (!Array.isArray(result?.translatedSegments)) {
+    throw new Error("The local backend did not return timed translated subtitle segments.");
+  }
+  if (Array.isArray(result.transcriptSegments) && result.translatedSegments.length !== result.transcriptSegments.length) {
+    throw new Error("The local backend returned mismatched subtitle segment counts.");
+  }
+  if (!result.translatedSegments.length && result.translatedText) {
+    throw new Error("The local backend returned translated text without timed subtitle segments.");
+  }
+  if (Number(result.generation) !== item.metadata.generation || Number(result.sequence) !== item.metadata.sequence) {
+    throw new Error("The local backend returned subtitle segments for the wrong chunk.");
+  }
+
+  const seenIds = new Set();
+  return result.translatedSegments.map((segment) => {
+    const id = typeof segment?.id === "string" ? segment.id.trim() : "";
+    const startMs = Number(segment?.startMs);
+    const endMs = Number(segment?.endMs);
+    const translatedText = segment?.translatedText;
+    if (!id) throw new Error("The local backend returned a subtitle segment without an ID.");
+    if (seenIds.has(id)) throw new Error("The local backend returned duplicate subtitle segment IDs.");
+    seenIds.add(id);
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || startMs < 0 || endMs <= startMs) {
+      throw new Error("The local backend returned invalid subtitle segment timing.");
+    }
+    if (typeof translatedText !== "string") {
+      throw new Error("The local backend returned invalid subtitle segment text.");
+    }
+
+    const normalized = {
+      id,
+      bufferedSessionId: local.bufferedSessionId,
+      generation: item.metadata.generation,
+      sequence: item.metadata.sequence,
+      startMs,
+      endMs,
+      translatedText
+    };
+    if (currentSession.config.showSourceTranscript && typeof segment.sourceText === "string") {
+      normalized.sourceText = segment.sourceText;
+    }
+    return normalized;
+  });
 }
 
 function assertCurrentSession(expectedSession) {

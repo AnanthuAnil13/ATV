@@ -4,12 +4,14 @@
 
   const core = window.AutoTranslateBufferedPlayerCore;
   const timeline = window.AutoTranslateMediaTimeline;
+  const schedulerCore = window.AutoTranslateSubtitleSchedulerCore;
   const SEGMENT_TIMESLICE_MS = 1000;
   const QUOTA_RETAIN_SECONDS = 5;
   const ROUTINE_RETAIN_SECONDS = 30;
   const SEEK_JUMP_TOLERANCE_MS = 2500;
 
   let controller = null;
+  let clockApiController = null;
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message?.type === "BUFFERED_PLAYER_START") {
@@ -56,6 +58,9 @@
     if (!timeline) {
       throw new Error("The buffered timeline helper module was not loaded.");
     }
+    if (!schedulerCore) {
+      throw new Error("The buffered playback clock helper module was not loaded.");
+    }
     if (!core.shouldActivateBufferedPlayer(config)) {
       throw new Error("Buffered playback is only available for local Ollama buffered mode.");
     }
@@ -65,11 +70,13 @@
 
     const nextController = createController(config);
     controller = nextController;
+    installPlaybackClockApi(nextController);
     try {
       await nextController.start();
       return nextController.publicStatus();
     } catch (error) {
       if (controller === nextController) controller = null;
+      removePlaybackClockApi(nextController);
       await nextController.stop({ removeRoot: true, report: false });
       throw error;
     }
@@ -80,6 +87,31 @@
     const oldController = controller;
     controller = null;
     await oldController.stop({ removeRoot: true, report: true });
+    removePlaybackClockApi(oldController);
+  }
+
+  function installPlaybackClockApi(targetController) {
+    clockApiController = targetController;
+    window.AutoTranslateBufferedPlaybackClock = Object.freeze({
+      getSnapshot() {
+        return clockApiController === targetController
+          ? targetController.playbackClockSnapshot()
+          : { status: "stopped", observedAtEpochMs: Date.now() };
+      },
+      subscribe(listener) {
+        return clockApiController === targetController
+          ? targetController.subscribeClock(listener)
+          : () => {};
+      }
+    });
+  }
+
+  function removePlaybackClockApi(targetController) {
+    if (clockApiController !== targetController) return;
+    clockApiController = null;
+    try { delete window.AutoTranslateBufferedPlaybackClock; } catch {
+      window.AutoTranslateBufferedPlaybackClock = undefined;
+    }
   }
 
   function createController(rawConfig) {
@@ -129,14 +161,23 @@
       lastTimelineSnapshot: null,
       lastReportedStatus: "",
       lastReportedAt: 0,
-      bufferedSeconds: 0
+      bufferedSeconds: 0,
+      clockRanges: [],
+      clockSubscribers: new Set(),
+      clockPumpActive: false,
+      clockVideoFrameHandle: null,
+      clockAnimationFrame: null,
+      nextSegmentSourceStartMs: null,
+      pendingAppendSegment: null
     };
 
     return {
       start,
       stop,
       publicStatus,
-      timelineSnapshot
+      timelineSnapshot,
+      playbackClockSnapshot,
+      subscribeClock
     };
 
     async function start() {
@@ -169,6 +210,8 @@
       }
       state.stopped = true;
       state.phase = core.reducePlayerLifecycle(state.phase, "STOP");
+      notifyClockSubscribers();
+      stopClockPump();
       clearTimeout(state.healthTimer);
       cancelAnimationFrame(state.placementFrame);
       state.placementFrame = null;
@@ -199,6 +242,7 @@
         generation: state.generation,
         bufferedSeconds: state.bufferedSeconds,
         currentTime: state.delayedVideo?.currentTime,
+        delayedSourceTimeMs: playbackClockSnapshot().delayedSourceTimeMs,
         sourceTime: state.sourceVideo?.currentTime,
         sequence: state.lastAppendedSequence
       };
@@ -212,6 +256,88 @@
       });
       state.lastTimelineSnapshot = snapshot;
       return snapshot;
+    }
+
+    function playbackClockSnapshot() {
+      const delayedMediaTimeMs = mediaSecondsToMs(state.delayedVideo?.currentTime);
+      const sourceTimeMs = mediaSecondsToMs(state.sourceVideo?.currentTime);
+      const delayedSourceTimeMs = delayedMediaTimeMs === null
+        ? null
+        : schedulerCore.calculateDelayedSourceTime(delayedMediaTimeMs, state.clockRanges, {
+            generation: state.generation,
+            pipelineEpoch: state.pipelineEpoch
+          });
+      return {
+        bufferedSessionId: state.bufferedSessionId,
+        generation: state.generation,
+        status: state.phase,
+        delayedMediaTimeMs,
+        delayedSourceTimeMs,
+        sourceTimeMs,
+        playbackRate: timeline.normalizePlaybackRate(state.sourceVideo?.playbackRate),
+        bufferedSeconds: state.bufferedSeconds,
+        observedAtEpochMs: Date.now(),
+        pipelineEpoch: state.pipelineEpoch
+      };
+    }
+
+    function subscribeClock(listener) {
+      if (typeof listener !== "function") return () => {};
+      state.clockSubscribers.add(listener);
+      try { listener(playbackClockSnapshot()); } catch {}
+      startClockPump();
+      return () => {
+        state.clockSubscribers.delete(listener);
+        if (!state.clockSubscribers.size) stopClockPump();
+      };
+    }
+
+    function notifyClockSubscribers() {
+      if (!state.clockSubscribers.size) return;
+      const snapshot = playbackClockSnapshot();
+      for (const listener of Array.from(state.clockSubscribers)) {
+        try { listener(snapshot); } catch {}
+      }
+    }
+
+    function startClockPump() {
+      if (state.clockPumpActive || state.stopped || !state.delayedVideo) return;
+      state.clockPumpActive = true;
+      scheduleClockPump();
+    }
+
+    function scheduleClockPump() {
+      if (!state.clockPumpActive || state.stopped || !state.clockSubscribers.size || !state.delayedVideo) {
+        state.clockPumpActive = false;
+        return;
+      }
+      if (typeof state.delayedVideo.requestVideoFrameCallback === "function") {
+        state.clockVideoFrameHandle = state.delayedVideo.requestVideoFrameCallback(() => {
+          state.clockVideoFrameHandle = null;
+          notifyClockSubscribers();
+          scheduleClockPump();
+        });
+        return;
+      }
+      state.clockAnimationFrame = requestAnimationFrame(() => {
+        state.clockAnimationFrame = null;
+        notifyClockSubscribers();
+        scheduleClockPump();
+      });
+    }
+
+    function stopClockPump() {
+      state.clockPumpActive = false;
+      try {
+        if (state.clockVideoFrameHandle !== null && state.delayedVideo?.cancelVideoFrameCallback) {
+          state.delayedVideo.cancelVideoFrameCallback(state.clockVideoFrameHandle);
+        }
+      } catch {}
+      if (state.clockAnimationFrame !== null) {
+        cancelAnimationFrame(state.clockAnimationFrame);
+      }
+      state.clockVideoFrameHandle = null;
+      state.clockAnimationFrame = null;
     }
 
     function emitTimelineEvent(eventType) {
@@ -246,7 +372,7 @@
       delayedVideo.volume = state.config.originalVolume;
       delayedVideo.muted = false;
       delayedVideo.preload = "auto";
-      delayedVideo.playbackRate = state.sourceVideo.playbackRate || 1;
+      delayedVideo.playbackRate = 1;
 
       const status = document.createElement("div");
       status.className = "autotranslate-buffered-status";
@@ -279,16 +405,19 @@
         if (state.phase !== "playing") {
           state.phase = "playing";
           reportStatus("playing");
+          notifyClockSubscribers();
         }
         updateBufferingOverlay();
       });
       addListener(delayedVideo, "timeupdate", () => {
         updateBufferedReadiness();
         evictOldBufferedMedia(ROUTINE_RETAIN_SECONDS);
+        notifyClockSubscribers();
       });
       addListener(delayedVideo, "ended", () => {
         state.phase = core.reducePlayerLifecycle(state.phase, "END");
         reportStatus("ended");
+        notifyClockSubscribers();
         updateBufferingOverlay("Buffered playback ended", "The delayed copy consumed the remaining captured media.");
       });
 
@@ -306,6 +435,9 @@
       state.appending = false;
       state.delayedPlaybackStarted = false;
       state.bufferedSeconds = 0;
+      state.clockRanges = [];
+      state.nextSegmentSourceStartMs = mediaSecondsToMs(state.sourceVideo?.currentTime);
+      state.pendingAppendSegment = null;
       state.captureStream = captureSourceMedia(state.sourceVideo);
       validateCapturedStream(state.sourceVideo, state.captureStream);
       setupMediaSource(state.recorderMimeType, epoch);
@@ -371,7 +503,18 @@
       addListener(state.recorder, "dataavailable", (event) => {
         if (state.stopped || !timeline.isCurrentPipelineEpoch(epoch, state.pipelineEpoch) || !event.data?.size) return;
         const sequence = state.nextSegmentSequence++;
-        const segment = { sequence, blob: event.data, size: event.data.size };
+        const sourceEndMs = mediaSecondsToMs(state.sourceVideo?.currentTime);
+        const sourceStartMs = state.nextSegmentSourceStartMs ?? sourceEndMs;
+        state.nextSegmentSourceStartMs = sourceEndMs;
+        const segment = {
+          sequence,
+          generation: state.generation,
+          pipelineEpoch: epoch,
+          blob: event.data,
+          size: event.data.size,
+          sourceStartMs,
+          sourceEndMs
+        };
         try {
           state.segmentQueue.enqueue(segment);
           console.debug("[AutoTranslate buffered player] segment", {
@@ -423,6 +566,7 @@
       } catch {}
       state.sourceBuffer = null;
       state.appending = false;
+      state.pendingAppendSegment = null;
       state.segmentQueue.clear();
       try {
         if (state.delayedVideo) {
@@ -458,11 +602,14 @@
         .then((buffer) => {
           if (state.stopped || !timeline.isCurrentPipelineEpoch(epoch, state.pipelineEpoch) || !state.sourceBuffer) return;
           try {
+            segment.delayedMediaStartMs = getBufferedMediaEndMs();
             state.sourceBuffer.appendBuffer(buffer);
             state.segmentQueue.shift();
             state.lastAppendedSequence = segment.sequence;
+            state.pendingAppendSegment = segment;
           } catch (error) {
             state.appending = false;
+            state.pendingAppendSegment = null;
             if (isQuotaExceeded(error) && evictOldBufferedMedia(QUOTA_RETAIN_SECONDS)) return;
             fail(new Error("SourceBuffer append failed during buffered playback."));
           }
@@ -476,12 +623,37 @@
 
     function onSourceBufferUpdateEnd(epoch) {
       if (!timeline.isCurrentPipelineEpoch(epoch, state.pipelineEpoch)) return;
+      addClockRangeForPendingAppend(epoch);
       state.appending = false;
       updateBufferedReadiness();
+      notifyClockSubscribers();
       if (!evictOldBufferedMedia(ROUTINE_RETAIN_SECONDS)) {
         maybeEndMediaSource();
         drainAppendQueue(epoch);
       }
+    }
+
+    function addClockRangeForPendingAppend(epoch) {
+      const segment = state.pendingAppendSegment;
+      state.pendingAppendSegment = null;
+      if (!segment || !timeline.isCurrentPipelineEpoch(epoch, state.pipelineEpoch)) return;
+      const range = schedulerCore.normalizeClockRange({
+        generation: state.generation,
+        pipelineEpoch: epoch,
+        delayedMediaStartMs: segment.delayedMediaStartMs,
+        delayedMediaEndMs: getBufferedMediaEndMs(),
+        sourceStartMs: segment.sourceStartMs,
+        sourceEndMs: segment.sourceEndMs
+      }, {
+        generation: state.generation,
+        pipelineEpoch: epoch
+      });
+      if (!range) return;
+      state.clockRanges.push(range);
+      state.clockRanges = schedulerCore.normalizeClockRanges(state.clockRanges, {
+        generation: state.generation,
+        pipelineEpoch: epoch
+      }).slice(-240);
     }
 
     function updateBufferedReadiness() {
@@ -519,13 +691,14 @@
     function playDelayedVideo() {
       if (state.stopped || state.sourcePaused || !state.delayedVideo) return;
       state.delayedPlaybackStarted = true;
-      state.delayedVideo.playbackRate = state.sourceVideo?.playbackRate || 1;
+      state.delayedVideo.playbackRate = 1;
       state.delayedVideo.play()
         .then(() => {
           if (state.stopped) return;
           state.phase = core.reducePlayerLifecycle(state.phase, "READY");
           state.root.dataset.playerStatus = "playing";
           reportStatus("playing");
+          notifyClockSubscribers();
         })
         .catch((error) => {
           state.delayedPlaybackStarted = false;
@@ -546,6 +719,7 @@
         } catch {}
         try { state.delayedVideo?.pause(); } catch {}
         reportStatus("paused");
+        notifyClockSubscribers();
         updateBufferingOverlay("Source video paused", "Resume the source video to continue delayed playback.");
       });
 
@@ -566,8 +740,8 @@
       addListener(source, "seeked", handleSourceSeeked);
 
       addListener(source, "ratechange", () => {
-        if (state.delayedVideo) state.delayedVideo.playbackRate = source.playbackRate || 1;
         emitTimelineEvent("ratechange");
+        notifyClockSubscribers();
       });
 
       addListener(source, "loadedmetadata", () => emitTimelineEvent("loadedmetadata"));
@@ -595,9 +769,12 @@
       state.phase = "rebuffering";
       try { state.delayedVideo?.pause(); } catch {}
       state.pipelineEpoch += 1;
+      state.clockRanges = [];
+      state.pendingAppendSegment = null;
       teardownMediaPipeline({ keepVideoElement: true });
       emitTimelineEvent("seeking");
       reportStatus("rebuffering");
+      notifyClockSubscribers();
       updateBufferingOverlay("Rebuffering after seek", "Waiting for the source video timeline to settle.");
     }
 
@@ -625,6 +802,7 @@
       state.lastSourceTimeStamp = performance.now();
       emitTimelineEvent(eventType);
       reportStatus("rebuffering");
+      notifyClockSubscribers();
       updateBufferingOverlay("Rebuffering delayed playback", "Captured media before the seek was discarded.");
 
       try {
@@ -655,6 +833,7 @@
             state.phase = "playing";
             state.root.dataset.playerStatus = "playing";
             reportStatus("playing");
+            notifyClockSubscribers();
           })
           .catch(() => fail(new Error("Delayed video playback failed after the source video resumed.")));
       } else {
@@ -784,6 +963,7 @@
           generation: state.generation,
           bufferedSeconds: state.bufferedSeconds,
           currentTime: state.delayedVideo?.currentTime,
+          delayedSourceTimeMs: playbackClockSnapshot().delayedSourceTimeMs,
           sourceTime: state.sourceVideo?.currentTime,
           sequence: state.lastAppendedSequence,
           ...extra
@@ -829,6 +1009,7 @@
         if (end > start + 0.5) {
           try {
             state.sourceBuffer.remove(start, end);
+            pruneClockRanges(end * 1000);
             return true;
           } catch (error) {
             if (isQuotaExceeded(error)) continue;
@@ -838,6 +1019,24 @@
         }
       }
       return false;
+    }
+
+    function pruneClockRanges(removedEndMs) {
+      const endMs = mediaSecondsToMs(removedEndMs / 1000);
+      if (endMs === null) return;
+      state.clockRanges = state.clockRanges.filter((range) => range.delayedMediaEndMs > endMs);
+    }
+
+    function getBufferedMediaEndMs() {
+      const buffered = state.sourceBuffer?.buffered || state.delayedVideo?.buffered;
+      if (!buffered?.length) return 0;
+      let end = 0;
+      for (let index = 0; index < buffered.length; index += 1) {
+        try {
+          end = Math.max(end, buffered.end(index) * 1000);
+        } catch {}
+      }
+      return Number.isFinite(end) && end >= 0 ? end : 0;
     }
 
     function addListener(target, type, listener, options) {
@@ -907,6 +1106,11 @@
   function clampVolume(value) {
     const number = Number(value);
     return Number.isFinite(number) ? Math.min(1, Math.max(0, number)) : 1;
+  }
+
+  function mediaSecondsToMs(value) {
+    const number = Number(value);
+    return Number.isFinite(number) && number >= 0 ? number * 1000 : null;
   }
 
   function sanitizeMediaError(error) {

@@ -324,9 +324,11 @@ The extension records the captured tab audio into short WebM/Opus segments and p
 5. synthesizes each translated turn with a stable Piper voice assigned to that inferred speaker
 6. returns translated text and optional WAV audio clips to the extension
 
-Local Whisper responses include structured speech segments. The backend normalizes each segment's chunk-relative Whisper timing and, when buffered chunk metadata is available, maps those segment times onto the source video timeline using the captured chunk start/end media times. For local subtitle-capable modes, Ollama now returns one translated subtitle item for each Whisper segment ID, preserving the backend-normalized timing in the response. Frontend subtitle cue scheduling and exact synchronized display are not implemented yet; those will be added in a later step.
+Local Whisper responses include structured speech segments. The backend normalizes each segment's chunk-relative Whisper timing and, when buffered chunk metadata is available, maps those segment times onto the source video timeline using the captured chunk start/end media times. For local buffered subtitle-capable modes, Ollama returns one translated subtitle item for each Whisper segment ID, and the extension schedules those cues against the delayed player's source-time clock. Pauses and seeks are generation-aware, and severely late cues are dropped instead of being displayed out of sync.
 
 Whole-chunk dubbing and speaker-turn inference remain a separate path from subtitle segment alignment. In **Subtitles + dub** mode, the backend may do separate Ollama work for subtitle-aligned segments and for speaker-aware dub turns so each path can keep its own output contract.
+
+Local Live mode and OpenAI mode still use their immediate/streaming subtitle behavior. Local dubbed audio is not synchronized to these subtitle cue timings yet.
 
 The backend stores only a small in-memory rolling text context for the active local session. Temporary audio and transcript files are deleted after each request.
 

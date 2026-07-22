@@ -91,6 +91,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return false;
   }
 
+  if (message.type === "OFFSCREEN_BUFFERED_SUBTITLE_SEGMENTS") {
+    forwardBufferedSubtitleSegments(message.payload).catch(console.error);
+    return false;
+  }
+
   if (message.type === "BUFFERED_PLAYER_STATUS") {
     handleBufferedPlayerStatus(message.payload).catch(console.error);
     return false;
@@ -169,6 +174,7 @@ async function startTranslation(payload = {}) {
     bufferedPlayer: bufferedPlayerEnabled ? { status: "idle" } : null,
     subtitlesEnabled,
     dubEnabled,
+    showSourceTranscript,
     error: null
   });
 
@@ -182,7 +188,11 @@ async function startTranslation(payload = {}) {
         showSourceTranscript,
         sourceLanguage: settings.sourceLanguage,
         targetLanguage: settings.targetLanguage,
-        provider: settings.provider
+        provider: settings.provider,
+        outputMode: settings.outputMode,
+        syncMode: settings.syncMode,
+        bufferedSessionId,
+        generation: 0
       }
     }).catch(() => null);
   }
@@ -284,6 +294,7 @@ async function handleOffscreenStatus(payload = {}) {
 async function forwardTranscript(payload = {}) {
   const { translationState } = await chrome.storage.session.get("translationState");
   if (!translationState?.subtitlesEnabled) return;
+  if (translationState.provider === "ollama" && translationState.syncMode === "buffered") return;
 
   const tabId = payload.tabId ?? translationState?.tabId;
   if (!tabId) return;
@@ -291,6 +302,19 @@ async function forwardTranscript(payload = {}) {
   await chrome.tabs.sendMessage(tabId, {
     type: "OVERLAY_TRANSCRIPT",
     payload
+  }).catch(() => null);
+}
+
+async function forwardBufferedSubtitleSegments(payload = {}) {
+  const { translationState } = await chrome.storage.session.get("translationState");
+  if (!isBufferedSubtitleTarget(translationState, payload)) return;
+
+  const normalized = normalizeBufferedSubtitlePayload(payload);
+  if (!normalized) return;
+
+  await chrome.tabs.sendMessage(normalized.tabId, {
+    type: "BUFFERED_SUBTITLE_SEGMENTS",
+    payload: normalized
   }).catch(() => null);
 }
 
@@ -340,7 +364,7 @@ async function injectSubtitleOverlay(tabId) {
 
   await chrome.scripting.executeScript({
     target: { tabId },
-    files: ["content/subtitles.js"]
+    files: ["content/subtitle-scheduler-core.js", "content/subtitles.js"]
   });
 }
 
@@ -352,7 +376,12 @@ async function injectBufferedPlayer(tabId, payload) {
 
   await chrome.scripting.executeScript({
     target: { tabId },
-    files: ["shared/media-timeline.js", "content/buffered-player-core.js", "content/buffered-player.js"]
+    files: [
+      "shared/media-timeline.js",
+      "content/buffered-player-core.js",
+      "content/subtitle-scheduler-core.js",
+      "content/buffered-player.js"
+    ]
   });
 
   const response = await chrome.tabs.sendMessage(tabId, {
@@ -456,6 +485,69 @@ async function handleBufferedPlayerStatus(payload = {}) {
     generation: bufferedPlayer.generation ?? translationState.generation,
     bufferedPlayer
   });
+  if (translationState.subtitlesEnabled && translationState.syncMode === "buffered") {
+    await chrome.tabs.sendMessage(tabId, {
+      type: "OVERLAY_STATUS",
+      payload: {
+        status: bufferedPlayer.status,
+        provider: translationState.provider,
+        syncMode: translationState.syncMode
+      }
+    }).catch(() => null);
+  }
+}
+
+function isBufferedSubtitleTarget(translationState, payload = {}) {
+  if (!translationState || translationState.status === "idle" || translationState.status === "error") return false;
+  if (!translationState.subtitlesEnabled) return false;
+  if (translationState.provider !== "ollama" || translationState.syncMode !== "buffered") return false;
+  if (!["subtitles", "both"].includes(translationState.outputMode)) return false;
+  if (!translationState.bufferedPlayerEnabled) return false;
+  if (!payload.tabId || payload.tabId !== translationState.tabId) return false;
+  if (!payload.bufferedSessionId || payload.bufferedSessionId !== translationState.bufferedSessionId) return false;
+  if (Number(payload.generation) !== Number(translationState.generation ?? 0)) return false;
+  return Array.isArray(payload.translatedSegments);
+}
+
+function normalizeBufferedSubtitlePayload(payload = {}) {
+  const tabId = sanitizeInteger(payload.tabId);
+  const generation = sanitizeInteger(payload.generation);
+  const sequence = sanitizeInteger(payload.sequence);
+  const bufferedSessionId = sanitizeSessionId(payload.bufferedSessionId);
+  if (!tabId || !bufferedSessionId || generation === undefined || sequence === undefined) return null;
+
+  const seenIds = new Set();
+  const translatedSegments = [];
+  for (const raw of payload.translatedSegments || []) {
+    const id = sanitizeCueId(raw?.id);
+    const startMs = sanitizeNonNegativeFinite(raw?.startMs);
+    const endMs = sanitizeNonNegativeFinite(raw?.endMs);
+    if (!id || seenIds.has(id) || startMs === undefined || endMs === undefined || endMs <= startMs) return null;
+    if (typeof raw.translatedText !== "string") return null;
+    seenIds.add(id);
+
+    const segment = {
+      id,
+      bufferedSessionId,
+      generation,
+      sequence,
+      startMs,
+      endMs,
+      translatedText: raw.translatedText.replace(/\s+/g, " ").trim().slice(0, 280)
+    };
+    if (typeof raw.sourceText === "string") {
+      segment.sourceText = raw.sourceText.replace(/\s+/g, " ").trim().slice(0, 220);
+    }
+    translatedSegments.push(segment);
+  }
+
+  return {
+    tabId,
+    bufferedSessionId,
+    generation,
+    sequence,
+    translatedSegments
+  };
 }
 
 function validateBufferedTimelineTarget(translationState, tabId, bufferedSessionId) {
@@ -538,6 +630,11 @@ function sanitizeNumber(value) {
   return Number.isFinite(number) ? number : undefined;
 }
 
+function sanitizeNonNegativeFinite(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : undefined;
+}
+
 function sanitizeInteger(value) {
   const number = Number(value);
   return Number.isInteger(number) && number >= 0 ? number : undefined;
@@ -545,4 +642,8 @@ function sanitizeInteger(value) {
 
 function sanitizeSessionId(value) {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function sanitizeCueId(value) {
+  return typeof value === "string" && value.trim() ? value.trim().slice(0, 160) : "";
 }
