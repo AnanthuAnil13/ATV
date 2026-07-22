@@ -330,6 +330,16 @@ For local buffered dub-capable modes, the backend now prepares one timed dub cli
 
 Local Live mode and OpenAI mode still use their immediate/streaming subtitle behavior. Local Live dubbing remains immediate. Audio stretching, fitted dub playback, and lip synchronization are not implemented.
 
+Piper synthesis uses the installed CLI's stdin input path. The backend invokes the configured command, preserves `PIPER_COMMAND_ARGS` such as `-m piper`, passes the voice with `-m/--model`, writes a WAV with `-f/--output-file`, and sends text through stdin rather than appending the text to the command line. Voices may be configured as explicit `.onnx` model paths or as Piper voice names. Voice names must be resolvable from the server working directory or a configured `PIPER_DATA_DIR`/`PIPER_DATA_DIRS`; Piper also requires the matching `.onnx.json` config file. Missing or unreadable voices are reported as `PIPER_VOICE_NOT_FOUND`.
+
+To verify Piper manually, download or place the voice files in a local voice directory and run:
+
+```bash
+printf '%s\n' 'Short test sentence.' | python -m piper --data-dir <voice-dir> -m en_US-lessac-medium -f /tmp/piper-check.wav
+```
+
+Local Live dubbing and buffered timed dubbing share this same corrected Piper runtime path.
+
 The backend stores only a small in-memory rolling text context for the active local session. Temporary audio and transcript files are deleted after each request.
 
 ## Remote backend deployment

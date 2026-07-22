@@ -50,9 +50,19 @@ import {
   buildTimedDubSynthesisPlan,
   determineTimedDubMode,
   mergeTimedDubSegments,
-  parseWavDurationMs,
   resolveTimedDubSpeakersWithRetry
 } from "./timedDubSegments.js";
+import {
+  PIPER_CLI_ARGUMENT_INVALID,
+  PIPER_OUTPUT_EMPTY,
+  PIPER_OUTPUT_MISSING,
+  PIPER_RUNTIME_UNAVAILABLE,
+  PIPER_SYNTHESIS_FAILED,
+  PIPER_SYNTHESIS_TIMEOUT,
+  PIPER_VOICE_NOT_FOUND,
+  checkPiperRuntime,
+  synthesizePiperToFile
+} from "./piperRuntime.js";
 
 dotenv.config();
 
@@ -70,12 +80,14 @@ const whisperExtraArgs = splitCommandArgs(process.env.WHISPER_EXTRA_ARGS || "");
 const ffmpegCommand = process.env.FFMPEG_PATH?.trim() || "ffmpeg";
 const piperCommand = process.env.PIPER_COMMAND?.trim() || "python";
 const piperCommandArgs = splitCommandArgs(process.env.PIPER_COMMAND_ARGS ?? "-m piper");
+const piperDataDirs = parsePathList(process.env.PIPER_DATA_DIRS || process.env.PIPER_DATA_DIR || "");
 const piperVoices = parseStringMap(process.env.PIPER_VOICES_JSON || "{}");
 const piperVoiceBanks = parsePiperVoiceBanks(process.env.PIPER_VOICE_BANK_JSON || "", piperVoices);
 const localCommandTimeoutMs = clampInteger(process.env.LOCAL_COMMAND_TIMEOUT_MS, 15_000, 300_000, 90_000);
 const maxDubTurnsPerChunk = clampInteger(process.env.LOCAL_DUB_MAX_TURNS_PER_CHUNK, 1, 12, 6);
 const rateBuckets = new Map();
 const localContexts = new Map();
+const piperRuntimeStatusCache = {};
 
 app.disable("x-powered-by");
 app.use(express.json({ limit: "32kb" }));
@@ -116,6 +128,7 @@ app.get("/languages", (req, res) => {
 
 app.get("/providers", async (req, res) => {
   const ollama = await getOllamaStatus();
+  const piper = await getPiperRuntimeStatus();
   res.json({
     providers: {
       openai: {
@@ -133,12 +146,18 @@ app.get("/providers", async (req, res) => {
         label: "Ollama local",
         available: ollama.available,
         supportsSubtitles: ollama.available,
-        supportsDub: ollama.available && hasPiperVoiceBanks(),
+        supportsDub: ollama.available && piper.voiceConfigured && piper.runtimeAvailable && piper.voiceResolvable,
         dubTargets: getPiperDubTargets(),
+        piper: {
+          voiceConfigured: piper.voiceConfigured,
+          runtimeAvailable: piper.runtimeAvailable,
+          voiceResolvable: piper.voiceResolvable,
+          synthesisTested: piper.synthesisTested
+        },
         models: ollama.models,
         defaultModel: resolveDefaultOllamaModel(ollama.models),
         chunkMs: 4500,
-        detail: ollama.detail
+        detail: ollama.available ? piper.detail : ollama.detail
       }
     }
   });
@@ -375,15 +394,13 @@ app.post(
 
           for (const [index, item] of synthesisPlan.entries()) {
             const outputPath = path.join(tempDir, `timed-dub-${index}.wav`);
-            await synthesizeWithPiper(item.segment.translatedText, targetLanguage, outputPath, item.voice);
-            const audioBuffer = await readFile(outputPath);
-            const audioDurationMs = parseWavDurationMs(audioBuffer);
+            const synthesis = await synthesizeWithPiper(item.segment.translatedText, targetLanguage, outputPath, item.voice);
             timedDubClips.push(buildTimedDubClipResponse({
               segment: item.segment,
               voice: item.voice,
-              audioBuffer,
+              audioBuffer: synthesis.audioBuffer,
               audioMime: "audio/wav",
-              audioDurationMs
+              audioDurationMs: synthesis.audioDurationMs
             }));
           }
         }
@@ -395,11 +412,11 @@ app.post(
         for (const [index, turn] of turns.entries()) {
           const outputPath = path.join(tempDir, `dub-${index}.wav`);
           const voice = assignPiperVoice(sessionId, targetLanguage, turn.speakerId);
-          await synthesizeWithPiper(turn.translatedText, targetLanguage, outputPath, voice);
+          const synthesis = await synthesizeWithPiper(turn.translatedText, targetLanguage, outputPath, voice);
           dubClips.push({
             speakerId: turn.speakerId,
             translatedText: turn.translatedText,
-            audioBase64: (await readFile(outputPath)).toString("base64"),
+            audioBase64: synthesis.audioBuffer.toString("base64"),
             audioMime: "audio/wav"
           });
         }
@@ -871,16 +888,37 @@ async function translateDialogueWithOllama({ model, sourceLanguage, targetLangua
 async function synthesizeWithPiper(text, targetLanguage, outputPath, assignedVoice = null) {
   const voice = assignedVoice || getPiperVoiceBank(targetLanguage)[0];
   if (!voice) throw createHttpError(400, `No Piper voice is configured for ${targetLanguage}.`);
-  await runCommand(piperCommand, [
-    ...piperCommandArgs,
-    "-m",
-    voice.model,
-    ...voice.args,
-    "-f",
-    outputPath,
-    "--",
-    text.slice(0, 1800)
-  ]);
+  try {
+    return await synthesizePiperToFile({
+      command: piperCommand,
+      commandArgs: piperCommandArgs,
+      voice,
+      outputPath,
+      text,
+      cwd: process.cwd(),
+      dataDirs: piperDataDirs,
+      runCommand
+    });
+  } catch (error) {
+    throw normalizePiperRuntimeError(error);
+  }
+}
+
+function normalizePiperRuntimeError(error) {
+  if (error?.statusCode) return error;
+  if ([
+    PIPER_RUNTIME_UNAVAILABLE,
+    PIPER_CLI_ARGUMENT_INVALID,
+    PIPER_VOICE_NOT_FOUND,
+    PIPER_SYNTHESIS_FAILED,
+    PIPER_SYNTHESIS_TIMEOUT,
+    PIPER_OUTPUT_MISSING,
+    PIPER_OUTPUT_EMPTY
+  ].includes(error?.code)) {
+    const statusCode = error.code === PIPER_SYNTHESIS_TIMEOUT ? 504 : 502;
+    return createHttpError(statusCode, error.message, error.code, true);
+  }
+  return error;
 }
 
 function runCommand(command, args, { stdin = null } = {}) {
@@ -892,12 +930,15 @@ function runCommand(command, args, { stdin = null } = {}) {
     let stdout = "";
     let stderr = "";
     let settled = false;
+    let stdinError = null;
 
     const timeout = setTimeout(() => {
       if (settled) return;
       settled = true;
       child.kill("SIGKILL");
-      reject(createHttpError(504, `${command} timed out after ${localCommandTimeoutMs} ms.`));
+      const error = createHttpError(504, `${command} timed out after ${localCommandTimeoutMs} ms.`);
+      error.timedOut = true;
+      reject(error);
     }, localCommandTimeoutMs);
 
     child.stdout.on("data", (chunk) => {
@@ -910,22 +951,38 @@ function runCommand(command, args, { stdin = null } = {}) {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
-      reject(createHttpError(503, `Could not start ${command}: ${error.message}`));
+      const wrapped = createHttpError(503, `Could not start ${command}: ${error.message}`);
+      wrapped.spawnErrorCode = error.code;
+      reject(wrapped);
     });
     child.on("close", (code) => {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
       if (code === 0) {
+        if (stdinError && stdinError.code !== "EPIPE") {
+          const error = createHttpError(502, `${command} stdin failed.`);
+          error.stdinErrorCode = stdinError.code;
+          reject(error);
+          return;
+        }
         resolve({ stdout, stderr });
       } else {
         const detail = cleanCommandError(stderr || stdout);
-        reject(createHttpError(502, `${command} exited with code ${code}${detail ? `: ${detail}` : "."}`));
+        const error = createHttpError(502, `${command} exited with code ${code}${detail ? `: ${detail}` : "."}`);
+        error.exitCode = code;
+        error.stderr = stderr;
+        error.stdout = stdout;
+        error.stdinErrorCode = stdinError?.code;
+        reject(error);
       }
     });
 
     if (stdin !== null) {
-      child.stdin.end(stdin);
+      child.stdin.on("error", (error) => {
+        stdinError = error;
+      });
+      child.stdin.end(stdin, "utf8");
     }
   });
 }
@@ -1114,6 +1171,18 @@ function assignPiperVoice(sessionId, targetLanguage, speakerId) {
   return voice;
 }
 
+async function getPiperRuntimeStatus() {
+  return checkPiperRuntime({
+    command: piperCommand,
+    commandArgs: piperCommandArgs,
+    voicesByLanguage: piperVoiceBanks,
+    cwd: process.cwd(),
+    dataDirs: piperDataDirs,
+    runCommand,
+    cache: piperRuntimeStatusCache
+  });
+}
+
 function hasPiperVoiceBanks() {
   return getPiperDubTargets().length > 0;
 }
@@ -1237,6 +1306,13 @@ function splitCommandArgs(value) {
   return args;
 }
 
+function parsePathList(value) {
+  return String(value || "")
+    .split(path.delimiter)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
 function extensionForContentType(contentType = "") {
   if (contentType.includes("ogg")) return "ogg";
   if (contentType.includes("mp4") || contentType.includes("m4a")) return "m4a";
@@ -1306,6 +1382,17 @@ function normalizeLocalPipelineError(error) {
       TIMED_DUB_TIMING_UNAVAILABLE,
       true
     );
+  }
+  if ([
+    PIPER_RUNTIME_UNAVAILABLE,
+    PIPER_CLI_ARGUMENT_INVALID,
+    PIPER_VOICE_NOT_FOUND,
+    PIPER_SYNTHESIS_FAILED,
+    PIPER_SYNTHESIS_TIMEOUT,
+    PIPER_OUTPUT_MISSING,
+    PIPER_OUTPUT_EMPTY
+  ].includes(error?.code)) {
+    return normalizePiperRuntimeError(error);
   }
   return error;
 }
