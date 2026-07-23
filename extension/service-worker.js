@@ -98,8 +98,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === "OFFSCREEN_BUFFERED_SUBTITLE_SEGMENTS") {
-    forwardBufferedSubtitleSegments(message.payload).catch(console.error);
-    return false;
+    forwardBufferedSubtitleSegments(message.payload, sender)
+      .then((result) => sendResponse(result))
+      .catch((error) => sendResponse({ ok: false, error: sanitizeError(error.message) || "Buffered subtitle delivery failed." }));
+    return true;
+  }
+
+  if (message.type === "OFFSCREEN_BUFFERED_TRANSLATION_COVERAGE") {
+    forwardBufferedTranslationCoverage(message.payload, sender)
+      .then((result) => sendResponse(result))
+      .catch((error) => sendResponse({ ok: false, error: sanitizeError(error.message) || "Buffered translation coverage delivery failed." }));
+    return true;
   }
 
   if (message.type === "OFFSCREEN_BUFFERED_TIMED_DUB_CLIPS") {
@@ -348,17 +357,42 @@ async function forwardTranscript(payload = {}) {
   }).catch(() => null);
 }
 
-async function forwardBufferedSubtitleSegments(payload = {}) {
+async function forwardBufferedSubtitleSegments(payload = {}, sender = {}) {
+  if (!isFromOffscreenDocument(sender)) return { ok: false, forwarded: false, error: "Buffered subtitle messages must come from the offscreen document." };
   const { translationState } = await chrome.storage.session.get("translationState");
-  if (!isBufferedSubtitleTarget(translationState, payload)) return;
+  if (!isBufferedSubtitleTarget(translationState, payload)) return { ok: true, forwarded: false, stale: true };
 
   const normalized = normalizeBufferedSubtitlePayload(payload);
-  if (!normalized) return;
+  if (!normalized) return { ok: false, forwarded: false, error: "Buffered subtitle segments were malformed." };
 
-  await chrome.tabs.sendMessage(normalized.tabId, {
-    type: "BUFFERED_SUBTITLE_SEGMENTS",
-    payload: normalized
-  }).catch(() => null);
+  try {
+    await chrome.tabs.sendMessage(normalized.tabId, {
+      type: "BUFFERED_SUBTITLE_SEGMENTS",
+      payload: normalized
+    });
+  } catch {
+    throw new Error("Buffered subtitle overlay is unavailable.");
+  }
+  return { ok: true, forwarded: true };
+}
+
+async function forwardBufferedTranslationCoverage(payload = {}, sender = {}) {
+  if (!isFromOffscreenDocument(sender)) return { ok: false, forwarded: false, error: "Buffered translation coverage must come from the offscreen document." };
+  const { translationState } = await chrome.storage.session.get("translationState");
+  if (!isBufferedTranslationCoverageTarget(translationState, payload)) return { ok: true, forwarded: false, stale: true };
+
+  const normalized = normalizeBufferedTranslationCoveragePayload(payload);
+  if (!normalized) return { ok: false, forwarded: false, error: "Buffered translation coverage was malformed." };
+
+  try {
+    await chrome.tabs.sendMessage(normalized.tabId, {
+      type: "BUFFERED_TRANSLATION_COVERAGE",
+      payload: normalized
+    });
+  } catch {
+    throw new Error("Buffered playback controller is unavailable.");
+  }
+  return { ok: true, forwarded: true };
 }
 
 async function forwardBufferedTimedDubClips(payload = {}, sender = {}) {
@@ -445,6 +479,7 @@ async function injectBufferedPlayer(tabId, payload) {
     files: [
       "shared/media-timeline.js",
       "content/buffered-player-core.js",
+      "content/translation-readiness-core.js",
       "content/subtitle-scheduler-core.js",
       "content/buffered-player.js"
     ]
@@ -653,6 +688,20 @@ function isBufferedTimedDubTarget(translationState, payload = {}) {
   return Array.isArray(payload.timedDubClips);
 }
 
+function isBufferedTranslationCoverageTarget(translationState, payload = {}) {
+  if (!translationState || translationState.status === "idle" || translationState.status === "error") return false;
+  if (!translationState.subtitlesEnabled) return false;
+  if (translationState.provider !== "ollama" || translationState.syncMode !== "buffered") return false;
+  if (!["subtitles", "both"].includes(translationState.outputMode)) return false;
+  if (!translationState.bufferedPlayerEnabled) return false;
+  if (!payload.tabId || payload.tabId !== translationState.tabId) return false;
+  if (!payload.bufferedSessionId || payload.bufferedSessionId !== translationState.bufferedSessionId) return false;
+  if (Number(payload.generation) !== Number(translationState.generation ?? 0)) return false;
+  const playerStatus = translationState.bufferedPlayer?.status;
+  if (playerStatus === "stopped" || playerStatus === "error" || playerStatus === "ended") return false;
+  return true;
+}
+
 function isBufferedTimedDubStatusTarget(translationState, tabId, payload = {}) {
   if (!translationState?.timedDubSchedulerEnabled || translationState.status === "idle") return false;
   if (!tabId || tabId !== translationState.tabId) return false;
@@ -709,6 +758,30 @@ function normalizeBufferedSubtitlePayload(payload = {}) {
     generation,
     sequence,
     translatedSegments
+  };
+}
+
+function normalizeBufferedTranslationCoveragePayload(payload = {}) {
+  const tabId = sanitizeInteger(payload.tabId);
+  const generation = sanitizeInteger(payload.generation);
+  const sequence = sanitizeInteger(payload.sequence);
+  const bufferedSessionId = sanitizeSessionId(payload.bufferedSessionId);
+  const startMs = sanitizeNonNegativeFinite(payload.startMs);
+  const endMs = sanitizeNonNegativeFinite(payload.endMs);
+  const translatedSegmentCount = sanitizeInteger(payload.translatedSegmentCount);
+  if (!tabId || !bufferedSessionId || generation === undefined || sequence === undefined) return null;
+  if (startMs === undefined || endMs === undefined || endMs <= startMs) return null;
+  if (translatedSegmentCount === undefined) return null;
+
+  return {
+    tabId,
+    bufferedSessionId,
+    generation,
+    sequence,
+    startMs,
+    endMs,
+    empty: payload.empty === true,
+    translatedSegmentCount
   };
 }
 
@@ -821,7 +894,7 @@ function clampVolume(value) {
 }
 
 function sanitizeBufferedPlayerStatus(payload = {}) {
-  const allowedStatus = new Set(["buffering", "rebuffering", "playing", "paused", "ended", "error", "stopped"]);
+  const allowedStatus = new Set(["buffering", "waiting-translation", "rebuffering", "playing", "paused", "ended", "error", "stopped"]);
   const status = allowedStatus.has(payload.status) ? payload.status : "buffering";
   return {
     status,
@@ -832,6 +905,14 @@ function sanitizeBufferedPlayerStatus(payload = {}) {
     currentTime: sanitizeNumber(payload.currentTime),
     sourceTime: sanitizeNumber(payload.sourceTime),
     delayedSourceTimeMs: sanitizeNumber(payload.delayedSourceTimeMs),
+    translationReadinessRequired: payload.translationReadinessRequired === true,
+    translationCoverageStartMs: sanitizeNumber(payload.translationCoverageStartMs),
+    translationReadyThroughMs: sanitizeNumber(payload.translationReadyThroughMs),
+    translationReadyLeadMs: sanitizeNumber(payload.translationReadyLeadMs),
+    translationReady: payload.translationReady === true,
+    mediaReady: payload.mediaReady === true,
+    waitingForTranslation: payload.waitingForTranslation === true,
+    translationCoverageCount: sanitizeInteger(payload.translationCoverageCount),
     pipelineEpoch: sanitizeInteger(payload.pipelineEpoch),
     sequence: Number.isInteger(payload.sequence) ? payload.sequence : undefined,
     updatedAt: Date.now()

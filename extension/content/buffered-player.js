@@ -5,6 +5,7 @@
   const core = window.AutoTranslateBufferedPlayerCore;
   const timeline = window.AutoTranslateMediaTimeline;
   const schedulerCore = window.AutoTranslateSubtitleSchedulerCore;
+  const readinessCore = window.AutoTranslateTranslationReadinessCore;
   const SEGMENT_TIMESLICE_MS = 1000;
   const QUOTA_RETAIN_SECONDS = 5;
   const ROUTINE_RETAIN_SECONDS = 30;
@@ -48,6 +49,16 @@
       return false;
     }
 
+    if (message?.type === "BUFFERED_TRANSLATION_COVERAGE") {
+      try {
+        const result = controller?.acceptTranslationCoverage(message.payload || {});
+        sendResponse(result || { ok: false, accepted: false, error: "Buffered playback controller is unavailable." });
+      } catch (error) {
+        sendResponse({ ok: false, accepted: false, error: sanitizeMediaError(error) });
+      }
+      return false;
+    }
+
     return false;
   });
 
@@ -61,6 +72,9 @@
     }
     if (!schedulerCore) {
       throw new Error("The buffered playback clock helper module was not loaded.");
+    }
+    if (!readinessCore) {
+      throw new Error("The buffered translation-readiness helper module was not loaded.");
     }
     if (!core.shouldActivateBufferedPlayer(config)) {
       throw new Error("Buffered playback is only available for local Ollama buffered mode.");
@@ -151,6 +165,15 @@
       },
       bufferedSessionId: String(rawConfig.bufferedSessionId || ""),
       generation: 0,
+      translationReadinessRequired: readinessCore.shouldRequireTranslationReadiness(rawConfig),
+      translationReadiness: readinessCore.createTranslationReadinessState({
+        bufferedSessionId: String(rawConfig.bufferedSessionId || ""),
+        generation: 0,
+        required: readinessCore.shouldRequireTranslationReadiness(rawConfig),
+        initialBufferSeconds: core.clampInitialBufferSeconds(rawConfig.initialBufferSeconds)
+      }),
+      mediaReady: false,
+      waitingForTranslation: false,
       seekCycle: {
         generation: 0,
         seekInProgress: false,
@@ -203,6 +226,7 @@
       start,
       stop,
       publicStatus,
+      acceptTranslationCoverage,
       timelineSnapshot,
       playbackClockSnapshot,
       subscribeClock,
@@ -254,6 +278,7 @@
 
       state.pipelineEpoch += 1;
       resetTimedDubActivity({ bufferedSessionId: state.bufferedSessionId, generation: state.generation });
+      resetTranslationReadiness(state.generation);
       teardownMediaPipeline({ keepVideoElement: false });
 
       restoreSourceVideo();
@@ -275,8 +300,35 @@
         currentTime: state.delayedVideo?.currentTime,
         delayedSourceTimeMs: playbackClockSnapshot().delayedSourceTimeMs,
         sourceTime: state.sourceVideo?.currentTime,
-        sequence: state.lastAppendedSequence
+        sequence: state.lastAppendedSequence,
+        ...readinessCore.createPublicReadinessSnapshot(state.translationReadiness),
+        mediaReady: state.mediaReady,
+        waitingForTranslation: state.waitingForTranslation
       };
+    }
+
+    function acceptTranslationCoverage(payload = {}) {
+      if (state.stopped) return { ok: false, accepted: false, error: "Buffered playback is stopped." };
+      if (payload.bufferedSessionId !== state.bufferedSessionId) {
+        return { ok: true, accepted: false, stale: true };
+      }
+      if (Number(payload.generation) !== state.generation) {
+        return { ok: true, accepted: false, stale: true };
+      }
+      const stats = readinessCore.insertTranslationCoverageRange(state.translationReadiness, payload, {
+        bufferedSessionId: state.bufferedSessionId,
+        generation: state.generation,
+        initialBufferSeconds: state.config.initialBufferSeconds
+      });
+      if (stats.rejected > 0) {
+        return { ok: false, accepted: false, error: "Buffered translation coverage was malformed." };
+      }
+      if (stats.stale > 0) {
+        return { ok: true, accepted: false, stale: true };
+      }
+      updateBufferedReadiness();
+      notifyClockSubscribers();
+      return { ok: true, accepted: stats.inserted > 0, duplicate: stats.duplicates > 0 };
     }
 
     function timelineSnapshot(eventType = "snapshot") {
@@ -307,6 +359,9 @@
         sourceTimeMs,
         playbackRate: timeline.normalizePlaybackRate(state.sourceVideo?.playbackRate),
         bufferedSeconds: state.bufferedSeconds,
+        ...readinessCore.createPublicReadinessSnapshot(state.translationReadiness),
+        mediaReady: state.mediaReady,
+        waitingForTranslation: state.waitingForTranslation,
         observedAtEpochMs: Date.now(),
         pipelineEpoch: state.pipelineEpoch
       };
@@ -490,6 +545,9 @@
       state.appending = false;
       state.delayedPlaybackStarted = false;
       state.bufferedSeconds = 0;
+      state.mediaReady = false;
+      state.waitingForTranslation = false;
+      resetTranslationReadiness(state.generation);
       state.clockRanges = [];
       state.nextSegmentSourceStartMs = mediaSecondsToMs(state.sourceVideo?.currentTime);
       state.pendingAppendSegment = null;
@@ -711,35 +769,94 @@
       }).slice(-240);
     }
 
+    function resetTranslationReadiness(generation) {
+      readinessCore.reduceTranslationReadinessState(state.translationReadiness, {
+        type: "SEEK_RESET",
+        generation
+      });
+      state.mediaReady = false;
+      state.waitingForTranslation = false;
+    }
+
     function updateBufferedReadiness() {
       if (!state.delayedVideo) return;
       state.bufferedSeconds = core.getPlayableBufferedAhead(
         state.delayedVideo.buffered,
         state.delayedVideo.currentTime
       );
-      updateBufferingOverlay();
 
       console.debug("[AutoTranslate buffered player] buffer", {
         bufferedSeconds: state.bufferedSeconds,
         delayedTime: state.delayedVideo.currentTime,
         sourceTime: state.sourceVideo?.currentTime,
-        phase: state.phase
+        phase: state.phase,
+        translationReadyLeadMs: state.translationReadiness.translationReadyLeadMs
       });
 
       if (state.sourcePaused) {
+        readinessCore.reduceTranslationReadinessState(state.translationReadiness, {
+          type: "PAUSE",
+          nowEpochMs: Date.now()
+        });
+        updateBufferingOverlay();
         reportStatus("paused");
         return;
       }
 
-      const ready = core.isInitialBufferReady({
+      const mediaReady = core.isInitialBufferReady({
         buffered: state.delayedVideo.buffered,
         currentTime: state.delayedVideo.currentTime,
         initialBufferSeconds: state.config.initialBufferSeconds
       });
-      if (!state.delayedPlaybackStarted && (ready || (state.sourceEnded && state.bufferedSeconds > 0))) {
+      state.mediaReady = mediaReady;
+      readinessCore.updateReadinessWatermark(state.translationReadiness, {
+        initialBufferSeconds: state.config.initialBufferSeconds
+      });
+      const translationReady = !state.translationReadinessRequired || state.translationReadiness.translationReady;
+      state.waitingForTranslation = !state.delayedPlaybackStarted &&
+        state.translationReadinessRequired &&
+        mediaReady &&
+        !translationReady;
+      const wasRebuffering = state.phase === "rebuffering";
+
+      if (state.waitingForTranslation) {
+        state.phase = "waiting-translation";
+        readinessCore.reduceTranslationReadinessState(state.translationReadiness, {
+          type: "WAITING",
+          mediaReady,
+          paused: state.sourcePaused || state.sourceVideo?.paused,
+          seeking: state.sourceVideo?.seeking,
+          rebuffering: wasRebuffering,
+          nowEpochMs: Date.now()
+        });
+        updateBufferingOverlay();
+        if (state.translationReadiness.timedOut) {
+          fail(new Error("Translation could not build the requested ready buffer. Try a larger buffer, a faster model, or shorter processing latency."), {
+            title: "Translated subtitles are not ready"
+          });
+          return;
+        }
+      } else {
+        if (!state.delayedPlaybackStarted && state.phase === "waiting-translation") {
+          state.phase = state.sourceVideo?.seeking ? "rebuffering" : "buffering";
+        }
+        readinessCore.reduceTranslationReadinessState(state.translationReadiness, {
+          type: mediaReady ? "READY" : "MEDIA_NOT_READY"
+        });
+        updateBufferingOverlay();
+      }
+
+      const canStart = !state.delayedPlaybackStarted && readinessCore.isInitialPlaybackGateSatisfied({
+        mediaReady: mediaReady || (!state.translationReadinessRequired && state.sourceEnded && state.bufferedSeconds > 0),
+        translationReadinessRequired: state.translationReadinessRequired,
+        translationReady
+      });
+      if (canStart) {
         playDelayedVideo();
       } else if (!state.delayedPlaybackStarted) {
-        reportStatus(state.phase === "rebuffering" ? "rebuffering" : "buffering");
+        reportStatus(state.waitingForTranslation
+          ? "waiting-translation"
+          : state.phase === "rebuffering" ? "rebuffering" : "buffering");
       }
     }
 
@@ -767,6 +884,10 @@
       addListener(source, "pause", () => {
         if (state.stopped || source.ended || source.seeking) return;
         state.sourcePaused = true;
+        readinessCore.reduceTranslationReadinessState(state.translationReadiness, {
+          type: "PAUSE",
+          nowEpochMs: Date.now()
+        });
         state.phase = core.reducePlayerLifecycle(state.phase, "PAUSE");
         emitTimelineEvent("pause");
         try {
@@ -825,6 +946,7 @@
       try { state.delayedVideo?.pause(); } catch {}
       state.pipelineEpoch += 1;
       state.clockRanges = [];
+      resetTranslationReadiness(state.generation);
       state.pendingAppendSegment = null;
       teardownMediaPipeline({ keepVideoElement: true });
       emitTimelineEvent("seeking");
@@ -853,6 +975,7 @@
       state.sourcePaused = state.sourceVideo.paused;
       state.sourceEnded = state.sourceVideo.ended;
       state.phase = "rebuffering";
+      resetTranslationReadiness(state.generation);
       state.lastSourceTime = state.sourceVideo.currentTime;
       state.lastSourceTimeStamp = performance.now();
       emitTimelineEvent(eventType);
@@ -876,6 +999,10 @@
       if (state.stopped || state.sourceVideo.seeking) return;
       state.sourcePaused = false;
       state.sourceEnded = false;
+      readinessCore.reduceTranslationReadinessState(state.translationReadiness, {
+        type: "RESUME",
+        nowEpochMs: Date.now()
+      });
       emitTimelineEvent(state.sourceVideo.paused ? "play" : "playing");
       state.phase = core.reducePlayerLifecycle(state.phase, "RESUME");
       try {
@@ -994,13 +1121,27 @@
       if (!state.root || !state.statusTitle || !state.statusDetail) return;
       const target = state.config.initialBufferSeconds;
       const buffered = Math.min(state.bufferedSeconds || 0, target);
+      const translationReadySeconds = Math.min(
+        state.translationReadiness.translationReadyLeadMs / 1000,
+        target
+      );
       state.root.dataset.playerStatus = state.phase === "error"
         ? "error"
         : state.phase === "playing"
           ? "playing"
           : "buffering";
-      state.statusTitle.textContent = title || "Buffering delayed playback";
-      state.statusDetail.textContent = detail || `Captured ${buffered.toFixed(1)} of ${target}s before playback starts.`;
+      if (title || detail) {
+        state.statusTitle.textContent = title || "Buffering delayed playback";
+        state.statusDetail.textContent = detail || `Captured ${buffered.toFixed(1)} of ${target}s before playback starts.`;
+        return;
+      }
+      if (state.waitingForTranslation) {
+        state.statusTitle.textContent = "Preparing translated subtitles";
+        state.statusDetail.textContent = `Translated ${translationReadySeconds.toFixed(1)} of ${target}s before playback starts.`;
+        return;
+      }
+      state.statusTitle.textContent = "Buffering delayed playback";
+      state.statusDetail.textContent = `Captured ${buffered.toFixed(1)} of ${target}s before playback starts.`;
     }
 
     function reportStatus(status, extra = {}) {
@@ -1020,6 +1161,9 @@
           currentTime: state.delayedVideo?.currentTime,
           delayedSourceTimeMs: playbackClockSnapshot().delayedSourceTimeMs,
           sourceTime: state.sourceVideo?.currentTime,
+          ...readinessCore.createPublicReadinessSnapshot(state.translationReadiness),
+          mediaReady: state.mediaReady,
+          waitingForTranslation: state.waitingForTranslation,
           sequence: state.lastAppendedSequence,
           pipelineEpoch: state.pipelineEpoch,
           ...extra

@@ -441,7 +441,7 @@ function updatePlaybackUi(active) {
   els.playbackModeHelp.textContent = !supported
     ? "Buffered playback is currently only available with Ollama local mode."
     : isBuffered
-      ? "The source video runs ahead while a delayed visible copy buffers."
+      ? "The source video runs ahead while delayed media buffers; local buffered subtitle modes also wait for translated coverage."
       : "Live leaves the page video timing unchanged.";
   if (!active) {
     els.startButton.disabled = !providerSupportsSelectedMode() || !supported;
@@ -522,7 +522,12 @@ function showBufferedPlayerMessage(state) {
     : "";
 
   if (player.status === "playing") {
-    showMessage("Delayed buffered video playback is running through Ollama local. Subtitle and dub timing are not synchronized yet.");
+    showMessage("Delayed buffered video playback is running through Ollama local.");
+  } else if (player.status === "waiting-translation") {
+    const ready = Number.isFinite(player.translationReadyLeadMs)
+      ? ` (${Math.min(player.translationReadyLeadMs / 1000, target).toFixed(1)} / ${target}s)`
+      : "";
+    showMessage(`Preparing translated subtitles${ready}. Keep the source video playing.`);
   } else if (player.status === "paused") {
     showMessage("The source video is paused; delayed buffered playback is paused too.");
   } else if (player.status === "ended") {

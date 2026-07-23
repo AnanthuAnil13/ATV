@@ -74,7 +74,7 @@
       const { status = "idle", error } = message.payload || {};
       statusEl.dataset.status = status;
       statusEl.textContent = labelForStatus(status);
-      if (state.mode === "buffered" && ["buffering", "rebuffering"].includes(status)) {
+      if (state.mode === "buffered" && ["buffering", "waiting-translation", "rebuffering"].includes(status)) {
         clearRenderedCues();
         if (state.scheduler) state.scheduler.active = [];
       }
@@ -215,7 +215,7 @@
     }
 
     state.latestClock = snapshot;
-    if (["rebuffering", "buffering"].includes(snapshot.status) && snapshot.delayedSourceTimeMs === null) {
+    if (["rebuffering", "buffering", "waiting-translation"].includes(snapshot.status) && snapshot.delayedSourceTimeMs === null) {
       clearRenderedCues();
       return;
     }
@@ -335,6 +335,7 @@
         starting: "Starting",
         connected: "Buffered",
         buffering: "Buffering",
+        "waiting-translation": "Translating",
         rebuffering: "Rebuffering",
         playing: "Buffered",
         paused: "Paused",

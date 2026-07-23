@@ -594,23 +594,50 @@ async function processLocalQueue(currentSession) {
       }
       assertCurrentSession(currentSession);
       if (shouldIgnoreBackendResult(local, item, result)) continue;
-      if (result.empty) continue;
 
       const elapsedMs = item.metadata.syncMode === "buffered"
         ? item.metadata.videoEndMs
         : Math.round(performance.now() - local.startedAt);
       if (shouldUseBufferedSubtitleSegments(currentSession.config)) {
+        if (result.empty) {
+          const coverage = await notifyBufferedTranslationCoverage(createBufferedTranslationCoveragePayload({
+            currentSession,
+            item,
+            empty: true,
+            translatedSegmentCount: 0
+          }));
+          if (!coverage?.ok || !coverage.forwarded) {
+            if (coverage?.stale) continue;
+            throw new Error(coverage?.error || "Buffered translation coverage could not be delivered to the page.");
+          }
+          continue;
+        }
         const translatedSegments = normalizeBufferedSubtitleSegments(result, item, currentSession);
         if (translatedSegments.length) {
-          notifyBufferedSubtitleSegments({
+          const delivery = await notifyBufferedSubtitleSegments({
             tabId: currentSession.config.tabId,
             bufferedSessionId: local.bufferedSessionId,
             generation: item.metadata.generation,
             sequence: item.metadata.sequence,
             translatedSegments
           });
+          if (!delivery?.ok || !delivery.forwarded) {
+            if (delivery?.stale) continue;
+            throw new Error(delivery?.error || "Timed subtitle segments could not be delivered to the page.");
+          }
+          const coverage = await notifyBufferedTranslationCoverage(createBufferedTranslationCoveragePayload({
+            currentSession,
+            item,
+            empty: false,
+            translatedSegmentCount: translatedSegments.length
+          }));
+          if (!coverage?.ok || !coverage.forwarded) {
+            if (coverage?.stale) continue;
+            throw new Error(coverage?.error || "Buffered translation coverage could not be delivered to the page.");
+          }
         }
       } else {
+        if (result.empty) continue;
         if (result.sourceText) {
           notifyTranscript({
             tabId: currentSession.config.tabId,
@@ -926,10 +953,17 @@ function notifyTranscript(payload) {
 }
 
 function notifyBufferedSubtitleSegments(payload) {
-  chrome.runtime.sendMessage({
+  return chrome.runtime.sendMessage({
     type: "OFFSCREEN_BUFFERED_SUBTITLE_SEGMENTS",
     payload
-  }).catch(() => null);
+  }).catch((error) => ({ ok: false, error: error.message }));
+}
+
+function notifyBufferedTranslationCoverage(payload) {
+  return chrome.runtime.sendMessage({
+    type: "OFFSCREEN_BUFFERED_TRANSLATION_COVERAGE",
+    payload
+  }).catch((error) => ({ ok: false, error: error.message }));
 }
 
 function notifyBufferedTimedDubClips(payload) {
@@ -949,6 +983,26 @@ function shouldUseBufferedTimedDubClips(config) {
   return config?.provider === "ollama" &&
     config?.syncMode === "buffered" &&
     (config?.outputMode === "dub" || config?.outputMode === "both");
+}
+
+function createBufferedTranslationCoveragePayload({ currentSession, item, empty, translatedSegmentCount }) {
+  const startMs = Number(item.metadata.videoStartMs);
+  const endMs = Number(item.metadata.videoEndMs);
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || startMs < 0 || endMs <= startMs) {
+    throw new Error("Buffered translation coverage cannot be reported without valid chunk timing.");
+  }
+  return {
+    tabId: currentSession.config.tabId,
+    bufferedSessionId: currentSession.local.bufferedSessionId,
+    generation: item.metadata.generation,
+    sequence: item.metadata.sequence,
+    startMs,
+    endMs,
+    empty: empty === true,
+    translatedSegmentCount: Number.isInteger(translatedSegmentCount) && translatedSegmentCount >= 0
+      ? translatedSegmentCount
+      : 0
+  };
 }
 
 function normalizeBufferedSubtitleSegments(result, item, currentSession) {
